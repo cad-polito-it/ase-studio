@@ -1849,7 +1849,7 @@ async function checkForUpdate() {
   try {
     const status = await api("/api/update-status");
     $("#update").hidden = !status.available;
-    $("#update").disabled = !status.canUpdate;
+    $("#update").disabled = !status.available;
     $("#update").title = status.message;
   } catch (_error) {
     $("#update").hidden = true;
@@ -1858,12 +1858,51 @@ async function checkForUpdate() {
 
 $("#update").onclick = async () => {
   $("#update").disabled = true;
-  lastNormalLog = "Updating repository…";
-  lastAdvancedLog = lastNormalLog;
-  updateLog();
-  showTab("output");
   try {
-    const result = await api("/api/update", {method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"});
+    const status = await api("/api/update-status");
+    let discardLocalChanges = false;
+    const blocked = (status.repositories || []).filter(repository => repository.dirty);
+    if (blocked.length) {
+      const details = blocked.map(repository => {
+        const changes = (repository.changes || []).slice(0, 12).join("\n");
+        const remainder = (repository.changes || []).length > 12
+          ? `\n… and ${repository.changes.length - 12} more` : "";
+        return `${repository.label}:\n${changes || "Local tracked changes"}${remainder}`;
+      }).join("\n\n");
+      const choice = await actionDialog({
+        title: "Local changes block update",
+        message: `The following tracked files would be overwritten by the update:\n\n${details}\n\nYou can open an issue to discuss preserving these changes, or discard them and align the local repositories with their remote branches. Untracked projects are not deleted.`,
+        confirmLabel: "Discard and update",
+        confirmValue: "discard",
+        alternateLabel: "Open issue",
+        alternateValue: "issue",
+        cancelLabel: "Cancel",
+        danger: true
+      });
+      if (choice === "issue") {
+        const title = encodeURIComponent("Help updating ASE Studio with local changes");
+        const body = encodeURIComponent(`ASE Studio detected local tracked changes before updating:\n\n${details}\n\nPlease advise how these changes should be preserved or integrated.`);
+        window.open(`https://github.com/cad-polito-it/ase-studio/issues/new?title=${title}&body=${body}`, "_blank", "noopener");
+        await checkForUpdate();
+        return;
+      }
+      if (choice !== "discard") {
+        await checkForUpdate();
+        return;
+      }
+      discardLocalChanges = true;
+    }
+    lastNormalLog = discardLocalChanges
+      ? "Discarding selected local tracked changes and updating repositories…"
+      : "Updating repositories…";
+    lastAdvancedLog = lastNormalLog;
+    updateLog();
+    showTab("output");
+    const result = await api("/api/update", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({discardLocalChanges})
+    });
     lastNormalLog = result.output;
     lastAdvancedLog = result.advancedOutput || result.output;
     updateLog();

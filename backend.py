@@ -3301,10 +3301,11 @@ def repository_update_status(path, label, refresh=False, ignored_paths=()):
         return {"label": label, "managed": True, "available": False,
                 "canUpdate": False, "message": f"{label}: {counts}"}
     ahead, behind = (int(value) for value in counts.split())
-    # Student projects are intentionally editable and must not prevent an
-    # application update. Git pathspec exclusions handle modified, deleted,
-    # renamed, and untracked project files without parsing porcelain output.
-    status_args = ["status", "--porcelain", "--", "."]
+    # Only tracked changes can be overwritten by a normal pull. Untracked
+    # student projects and generated output are intentionally preserved and
+    # do not disable updates. Shared tracked files such as programs/demo.mk
+    # must remain visible to the preflight check.
+    status_args = ["status", "--porcelain", "--untracked-files=no", "--", "."]
     status_args.extend(f":(exclude){item}" for item in ignored_paths)
     _, dirty_output = git_run(status_args, cwd=path)
     dirty_lines = dirty_output.splitlines()
@@ -3315,11 +3316,14 @@ def repository_update_status(path, label, refresh=False, ignored_paths=()):
     if ahead:
         message += f" Local checkout is {ahead} commit{'s' if ahead != 1 else ''} ahead."
     if dirty:
-        message += " Local changes must be committed or stashed before updating."
+        message += " Local tracked changes require a choice before updating."
     return {"label": label, "managed": True, "available": available,
             "canUpdate": available and not dirty, "dirty": dirty, "branch": branch,
             "remoteRef": remote_ref, "detached": not bool(branch),
-            "behind": behind, "message": message}
+            "behind": behind, "message": message, "path": str(path),
+            "changes": dirty_lines,
+            "restorePathspec": [".", *(f":(exclude){item}"
+                                           for item in ignored_paths)]}
 
 
 def rebuild_configured_gem5(repository):
@@ -3385,7 +3389,7 @@ def update_status(refresh=False):
             ROOT,
             "Simulator",
             refresh,
-            ignored_paths=("ase_studio", "programs/**"),
+            ignored_paths=("ase_studio",),
         ),
         repository_update_status(STUDIO_ROOT, "ASE Studio", refresh),
         gem5_update_status(refresh),
@@ -3404,13 +3408,46 @@ def update_status(refresh=False):
     }
 
 
-def pull_update():
+def discard_tracked_repository_changes(repository, pathspec=(".",)):
+    """Restore tracked files after the user explicitly chooses discard."""
+    repository = Path(repository)
+    restored, output = git_run(
+        ["restore", "--source=HEAD", "--staged", "--worktree", "--", *pathspec],
+        cwd=repository,
+    )
+    if not restored:
+        return False, output or "Git could not restore the tracked files."
+    return True, output
+
+
+def pull_update(discard_local_changes=False):
     status = update_status(refresh=True)
     if not status["available"]:
         return {"ok": True, "output": status["message"], "advancedOutput": status["message"]}
+    discard_outputs = []
     if not status["canUpdate"]:
-        return {"ok": False, "output": status["message"], "advancedOutput": status["message"]}
-    outputs = []
+        blocked = [item for item in status["repositories"] if item.get("dirty")]
+        if not discard_local_changes:
+            return {"ok": False, "needsDecision": True,
+                    "repositories": blocked, "output": status["message"],
+                    "advancedOutput": status["message"]}
+        for item in blocked:
+            restored, restore_output = discard_tracked_repository_changes(
+                item["path"], item.get("restorePathspec", ["."]))
+            if not restored:
+                message = (f"Could not discard tracked changes in {item['label']}:\n"
+                           f"{restore_output}")
+                return {"ok": False, "output": message, "advancedOutput": message}
+            changed = "\n".join(item.get("changes", [])) or "tracked files"
+            discard_outputs.append(
+                f"{item['label']}: discarded these local tracked changes before update:\n"
+                f"{changed}")
+        status = update_status(refresh=False)
+        if not status["canUpdate"]:
+            message = ("Tracked changes were restored, but the update is still blocked.\n"
+                       + status["message"])
+            return {"ok": False, "output": message, "advancedOutput": message}
+    outputs = discard_outputs
     ok = True
     parent = status["repositories"][0]
     if parent["available"]:
@@ -3557,7 +3594,10 @@ class Handler(SimpleHTTPRequestHandler):
             if self.path == "/api/install-tool":
                 return self.send_json(launch_component_installer(data.get("component")))
             if self.path == "/api/update":
-                return self.send_json(pull_update())
+                discard = data.get("discardLocalChanges", False)
+                if not isinstance(discard, bool):
+                    fail("Invalid update option.")
+                return self.send_json(pull_update(discard))
             if self.path == "/api/open-with":
                 return self.send_json(open_with_editor(data.get("name")))
             if self.path == "/api/submit":
