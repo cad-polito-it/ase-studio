@@ -65,7 +65,8 @@ DEFAULT_CONFIG = {
     "intAluPipelined": True, "intMulPipelined": True,
     "intDivPipelined": True, "floatAluPipelined": True,
     "floatMulPipelined": True, "floatDivPipelined": False,
-    "forwarding": True,
+    "forwarding": True, "compressedInstructions": False,
+    "floatingPointPrecision": "single",
     "memoryMode": "direct", "cacheStalls": False,
     "instructionMemoryLatency": 1, "dataReadLatency": 1,
     "dataWriteLatency": 1,
@@ -189,6 +190,14 @@ def validate_config(value):
     if not isinstance(value.get("forwarding"), bool):
         fail("Invalid CPU option.")
     config["forwarding"] = value["forwarding"]
+    compressed = value.get("compressedInstructions", False)
+    if not isinstance(compressed, bool):
+        fail("The compressed-instruction option must be enabled or disabled.")
+    config["compressedInstructions"] = compressed
+    precision = value.get("floatingPointPrecision", "single")
+    if precision not in {"single", "double"}:
+        fail("Select single- or double-precision floating point.")
+    config["floatingPointPrecision"] = precision
     memory_mode = value.get("memoryMode")
     legacy_ideal = (memory_mode == "ideal"
                     or (memory_mode is None and not value.get("cacheStalls")))
@@ -749,6 +758,12 @@ def run_command(command, cwd, env):
 def build(name):
     folder = project_dir(name)
     env = settings_env()
+    cpu_config = project_config(folder)
+    floating_extensions = ("fd" if cpu_config["floatingPointPrecision"] == "double"
+                           else "f")
+    compressed_extension = "c" if cpu_config["compressedInstructions"] else ""
+    env["ASE_RISCV_MARCH"] = (
+        f"rv32ima{floating_extensions}{compressed_extension}_zicsr_zifencei")
     env["program"] = artifact_stem(folder)
     clean_rc, clean_output = run_command(["make", "clean"], folder, env)
     rc, output = run_command(["make"], folder, env)
@@ -878,18 +893,35 @@ def normalize_instruction(text):
     text = re.sub(r"\bbeqz\s+(x\d+)\s*,", r"beq \1, x0,", text)
     text = re.sub(r"\b(f(?:add|sub|mul|div|mv))_s\b", r"\1.s", text)
     text = re.sub(r"\bfmv[._]([wx])[._]([wx])\b", r"fmv.\1.\2", text)
+    text = re.sub(r"^c[._]", "", text)
+    text = re.sub(r"^(?:fld|flw|ld|lw|fsd|fsw|sd|sw)sp\b",
+                  lambda match: match.group(0)[:-2], text)
     text = re.sub(r"\s+", "", text)
     # gem5 prints the common `li` pseudo-instruction as its real addi form.
     match = re.fullmatch(r"li(x\d+),(.+)", text)
     if match:
         text = f"addi{match.group(1)},x0,{match.group(2)}"
-    return text.replace("c_", "")
+    return text
 
 
 def display_instruction(text):
-    """Use normal assembly spelling for gem5's underscore FP mnemonics."""
-    text = re.sub(r"\b(f[a-z0-9]+)_([sdq])\b", r"\1.\2", text.strip(), flags=re.I)
-    return re.sub(r"\bfmv_([wx])_([wx])\b", r"fmv.\1.\2", text, flags=re.I)
+    """Use standard assembly spelling for gem5's internal mnemonics."""
+    text = text.strip()
+    parts = text.split(None, 1)
+    if not parts:
+        return text
+    mnemonic = parts[0]
+    atomic = re.fullmatch(r"(amo[a-z]+|lr|sc)_w(?:\[[^]]+\])?", mnemonic,
+                          flags=re.I)
+    if mnemonic.lower().startswith("c_"):
+        mnemonic = "c." + mnemonic[2:].replace("_", ".")
+    elif atomic:
+        mnemonic = atomic.group(1) + ".w"
+    elif mnemonic.lower() == "fence_i":
+        mnemonic = "fence.i"
+    elif mnemonic.lower().startswith("f"):
+        mnemonic = mnemonic.replace("_", ".")
+    return mnemonic + ((" " + parts[1]) if len(parts) > 1 else "")
 
 
 def cycle_for_nearest_tick(tick, ordered_ticks):
@@ -916,14 +948,22 @@ def parse_exec_playback(lines, ordered_ticks):
         cycle = str(cycle_for_nearest_tick(int(tick_text), ordered_ticks))
         data_match = re.search(r"\bD=(0x[0-9a-fA-F]+)", result)
         address_match = re.search(r"\bA=(0x[0-9a-fA-F]+)", result)
-        display_value = "0x" + data_match.group(1)[2:][-8:].lower() if data_match else "—"
+        data_digits = data_match.group(1)[2:].lower() if data_match else ""
         if data_match and "MemWrite" not in op_class:
             destination = destination_register(instruction)
             if destination:
-                register_deltas[cycle][destination] = display_value
+                width = 16 if destination.startswith("f") else 8
+                register_deltas[cycle][destination] = (
+                    "0x" + data_digits[-width:].zfill(width))
         if address_match:
+            opcode = display_instruction(instruction).split(None, 1)[0].lower()
+            memory_bits = 64 if opcode in {"fld", "fsd"} else 32
+            memory_digits = memory_bits // 4
+            display_value = ("0x" + data_digits[-memory_digits:].zfill(memory_digits)
+                             if data_match else "—")
             memory_deltas[cycle][address_match.group(1).lower()] = {
                 "value": display_value,
+                "bits": memory_bits,
                 "access": "write" if "MemWrite" in op_class else "read",
                 "pc": "0x" + pc.lower(),
             }
@@ -938,14 +978,20 @@ def parse_taken_jumps(lines, ordered_ticks):
         if not match:
             continue
         tick, address, instruction, _op_class, _result = match.groups()
-        executed.append((int(tick), address.lower(), display_instruction(instruction)))
+        raw_mnemonic = instruction.split(None, 1)[0].lower()
+        instruction_bytes = 2 if raw_mnemonic.startswith(("c_", "c.")) else 4
+        executed.append((int(tick), address.lower(), display_instruction(instruction),
+                         instruction_bytes))
     jumps = []
     control_instruction = re.compile(
-        r"^(?:b(?:eq|ne|lt|ge|ltu|geu)|j|jr|jal|jalr|ret)\b", re.I)
-    for (tick, source, instruction), (_next_tick, target, _next_instruction) in zip(executed, executed[1:]):
+        r"^(?:c\.)?(?:b(?:eq|eqz|ne|nez|lt|ge|ltu|geu)|j|jr|jal|jalr|ret)\b",
+        re.I,
+    )
+    for ((tick, source, instruction, instruction_bytes),
+         (_next_tick, target, _next_instruction, _next_bytes)) in zip(executed, executed[1:]):
         if not control_instruction.match(instruction.strip()):
             continue
-        if int(target, 16) == int(source, 16) + 4:
+        if int(target, 16) == int(source, 16) + instruction_bytes:
             continue
         jumps.append({
             "fromAddress": source,
@@ -1030,10 +1076,12 @@ def compact_iterations(rows):
             target = {"instruction": row["instruction"], "address": row.get("address"),
                       "cycles": {}, "iterations": 0,
                       "squashedFetches": 0,
+                      "cacheEvents": [],
                       "sourceLine": row.get("sourceLine")}
             by_address[key] = target
             compacted.append(target)
         target["cycles"].update(row["cycles"])
+        target["cacheEvents"].extend(row.get("cacheEvents", []))
         if row.get("squashed"):
             target["squashedFetches"] += 1
         else:
@@ -1086,6 +1134,23 @@ def parse_minor(path: Path, source_body="", include_fetch_stalls=True):
                 "pcDeltas": {}, "memoryDeltas": {}, "jumps": []}
     ticks = sorted({item[0] for item in raw})
     cycle_for_tick = {tick: index + 1 for index, tick in enumerate(ticks)}
+    # A fetch-only wait is the instruction cache servicing that fetch, so it
+    # remains F.  If a downstream stage is stalled in the same cycle, the
+    # front end is instead held by pipeline back-pressure and remains S.
+    downstream_stall_cycles = {
+        cycle_for_tick[tick]
+        for tick, stage, stalled, _address, _instruction in raw
+        if stalled and stage != "fetch1"
+    }
+
+    def is_memory_access(instruction):
+        displayed = display_instruction(instruction).strip().lower()
+        opcode = displayed.split(None, 1)[0] if displayed else ""
+        return bool(re.fullmatch(
+            r"(?:l(?:b|bu|h|hu|w|wu|d)|fl[wdq]|s[bhwdq]|fs[wdq])",
+            opcode,
+        ))
+
     for tick, stage, stalled, address, instruction in raw:
         cycle = cycle_for_tick[tick]
         if stage == "fetch1":
@@ -1097,7 +1162,10 @@ def parse_minor(path: Path, source_body="", include_fetch_stalls=True):
                     fetched[address].append({"first": cycle, "stalls": []})
                 last_fetch_address = address
             elif fetched[address]:
-                fetched[address][-1]["stalls"].append(cycle)
+                fetched[address][-1]["stalls"].append((
+                    cycle,
+                    "S" if cycle in downstream_stall_cycles else "F",
+                ))
             continue
         if stage == "decode":
             if stalled:
@@ -1125,8 +1193,8 @@ def parse_minor(path: Path, source_body="", include_fetch_stalls=True):
             fetched[address].clear()
             if fetch:
                 row["cycles"][str(fetch["first"])] = "F"
-                for stall_cycle in fetch["stalls"]:
-                    row["cycles"][str(stall_cycle)] = "S"
+                for stall_cycle, fetch_stage in fetch["stalls"]:
+                    row["cycles"][str(stall_cycle)] = fetch_stage
             for stall_cycle in pending_decode_stalls.pop(address, []):
                 row["cycles"][str(stall_cycle)] = "S"
             row["cycles"][str(cycle)] = "D"
@@ -1147,7 +1215,12 @@ def parse_minor(path: Path, source_body="", include_fetch_stalls=True):
                         if "M" in candidate["cycles"].values()
                         and "W" not in candidate["cycles"].values()), None)
         if row:
-            row["cycles"][str(cycle)] = "S" if stalled else STAGES[stage]
+            if stalled:
+                visible_stage = ("M" if stage == "memory"
+                                 and is_memory_access(instruction) else "S")
+            else:
+                visible_stage = STAGES[stage]
+            row["cycles"][str(cycle)] = visible_stage
             if stage == "writeback":
                 while candidates and "W" in candidates[0]["cycles"].values():
                     candidates.popleft()
@@ -1163,7 +1236,22 @@ def parse_minor(path: Path, source_body="", include_fetch_stalls=True):
         if not occupied:
             continue
         for cycle in range(occupied[0], occupied[-1] + 1):
-            row["cycles"].setdefault(str(cycle), "S")
+            cycle_text = str(cycle)
+            if cycle_text not in row["cycles"]:
+                row["cycles"][cycle_text] = "S"
+                row.setdefault("inferredGaps", []).append(cycle)
+        # MinorGUI does not always emit a final stalled-memory event on the
+        # response cycle.  Once a load/store has entered M, every cycle until
+        # W is cache/memory occupancy rather than an unexplained stall.
+        if is_memory_access(row["instruction"]):
+            memory = min((int(cycle) for cycle, stage in row["cycles"].items()
+                          if stage == "M"), default=None)
+            writeback = min((int(cycle) for cycle, stage in row["cycles"].items()
+                             if stage == "W" and int(cycle) > (memory or 0)),
+                            default=None)
+            if memory is not None and writeback is not None:
+                for cycle in range(memory, writeback):
+                    row["cycles"][str(cycle)] = "M"
     rows.sort(key=lambda row: min(map(int, row["cycles"]), default=0))
     compacted = compact_iterations(rows)
     add_source_lines(compacted, source_body)
@@ -1443,6 +1531,408 @@ def data_symbols(folder):
             "kind": symbol["kind"],
         })
     return symbols
+
+
+def elf_memory_map(folder):
+    """Return allocated ELF sections for the educational memory-map panel."""
+    elf = folder / f"{artifact_stem(folder)}.elf"
+    if not elf.exists():
+        return []
+    env = settings_env()
+    try:
+        result = subprocess.run(
+            [env.get("OBJDUMP", "objdump"), "-h", str(elf)],
+            cwd=folder, env=env, text=True, capture_output=True,
+        )
+    except OSError:
+        return []
+    if result.returncode:
+        return []
+    symbol_addresses = {}
+    objdump = Path(env.get("OBJDUMP", "objdump"))
+    nm_name = (objdump.name[:-len("objdump")] + "nm"
+               if objdump.name.endswith("objdump") else "nm")
+    try:
+        symbols = subprocess.run(
+            [str(objdump.with_name(nm_name)), "-n", str(elf)], cwd=folder,
+            env=env, text=True, capture_output=True,
+        )
+        if symbols.returncode == 0:
+            for line in symbols.stdout.splitlines():
+                fields = line.split()
+                if (len(fields) >= 3
+                        and re.fullmatch(r"[0-9a-fA-F]+", fields[0])):
+                    symbol_addresses[fields[-1]] = int(fields[0], 16)
+    except OSError:
+        pass
+
+    sections = []
+    lines = result.stdout.splitlines()
+    header = re.compile(
+        r"^\s*\d+\s+(\S+)\s+([0-9a-fA-F]+)\s+"
+        r"([0-9a-fA-F]+)\s+[0-9a-fA-F]+\s+[0-9a-fA-F]+\s+\S+\s*$")
+    for index, line in enumerate(lines):
+        match = header.match(line)
+        if not match:
+            continue
+        name, size_text, start_text = match.groups()
+        size, start = int(size_text, 16), int(start_text, 16)
+        flags = (lines[index + 1].strip().split(", ")
+                 if index + 1 < len(lines) else [])
+        if not size or "ALLOC" not in flags:
+            continue
+        if "CODE" in flags:
+            kind = "code"
+        elif "DATA" in flags and "READONLY" in flags:
+            kind = "read-only data"
+        elif "DATA" in flags:
+            kind = "data"
+        elif "LOAD" not in flags:
+            kind = "zero-initialized data"
+        else:
+            kind = "allocated"
+        section = {
+            "name": name,
+            "kind": kind,
+            "start": f"0x{start:x}",
+            "end": f"0x{start + size - 1:x}",
+            "size": size,
+        }
+        if name == ".text":
+            entry = symbol_addresses.get("_start")
+            end = symbol_addresses.get("End")
+            stop = start + size
+            if (entry is not None and end is not None
+                    and start <= entry <= end <= stop):
+                parts = []
+                if entry > start:
+                    parts.append({
+                        "name": "Before _start",
+                        "start": f"0x{start:x}", "end": f"0x{entry - 1:x}",
+                        "size": entry - start,
+                    })
+                parts.append({
+                    "name": "Pipeline-visible code",
+                    "start": f"0x{entry:x}",
+                    "end": f"0x{max(entry, end) - 1:x}" if end > entry else "—",
+                    "size": end - entry,
+                })
+                if end < stop:
+                    parts.append({
+                        "name": "Protected End block / remainder",
+                        "start": f"0x{end:x}", "end": f"0x{stop - 1:x}",
+                        "size": stop - end,
+                    })
+                section["parts"] = parts
+        sections.append(section)
+    return sorted(sections, key=lambda section: int(section["start"], 16))
+
+
+def gem5_statistics(path: Path):
+    """Read scalar gem5 statistics without depending on their comments."""
+    if not path.exists():
+        return {}
+    statistics = {}
+    for line in path.read_text(errors="replace").splitlines():
+        match = re.match(r"^(\S+)\s+(\S+)", line)
+        if not match:
+            continue
+        name, value = match.groups()
+        try:
+            statistics[name] = float(value)
+        except ValueError:
+            continue
+    return statistics
+
+
+def cache_size_bytes(value):
+    """Convert gem5 sizes such as 1kB or 32KiB to bytes."""
+    match = re.fullmatch(r"\s*(\d+)\s*([kKmMgG]i?[bB]|[bB])?\s*", str(value))
+    if not match:
+        return 0
+    amount = int(match.group(1))
+    suffix = (match.group(2) or "B").lower()
+    multiplier = 1
+    if suffix.startswith("k"):
+        multiplier = 1024
+    elif suffix.startswith("m"):
+        multiplier = 1024 ** 2
+    elif suffix.startswith("g"):
+        multiplier = 1024 ** 3
+    return amount * multiplier
+
+
+class CacheAccessTracker:
+    """Small LRU mirror of gem5's two-way L1 caches for trace annotation."""
+
+    def __init__(self, size, line_size, associativity=2):
+        self.line_size = max(1, int(line_size))
+        lines = max(1, cache_size_bytes(size) // self.line_size)
+        self.associativity = max(1, min(associativity, lines))
+        self.set_count = max(1, lines // self.associativity)
+        self.sets = defaultdict(list)
+        self.seen_lines = set()
+
+    def access(self, address):
+        line_number = int(address) // self.line_size
+        set_index = line_number % self.set_count
+        tag = line_number // self.set_count
+        ways = self.sets[set_index]
+        resident_before = sorted(
+            (resident_tag * self.set_count + resident_set) * self.line_size
+            for resident_set, resident_ways in self.sets.items()
+            for resident_tag in resident_ways
+        )
+        hit = tag in ways
+        if hit:
+            ways.remove(tag)
+            reason = "the cache line is already resident"
+        elif len(ways) >= self.associativity:
+            ways.pop(0)
+            reason = ("cold miss (first access to this cache line)"
+                      if line_number not in self.seen_lines
+                      else "conflict/capacity miss (the line was evicted)")
+        else:
+            reason = ("cold miss (first access to this cache line)"
+                      if line_number not in self.seen_lines
+                      else "miss (the line is no longer resident)")
+        ways.append(tag)
+        self.seen_lines.add(line_number)
+        return hit, line_number * self.line_size, reason, resident_before
+
+
+def cache_symbol_label(address, symbols):
+    """Use a compiled symbol (and vector index) when one owns an address."""
+    for symbol in symbols:
+        start = int(symbol["address"], 16)
+        end = start + int(symbol.get("size", 0))
+        if start <= address < end:
+            offset = address - start
+            if symbol.get("size", 0) > 4 and offset % 4 == 0:
+                return f"{symbol['name']}[{offset // 4}]"
+            return (symbol["name"] if not offset
+                    else f"{symbol['name']}+0x{offset:x}")
+    return f"0x{address:x}"
+
+
+def add_cache_analysis(data, configuration, result_dir, symbols):
+    """Attach cache misses to rows and produce a concise gem5 cache report.
+
+    gem5's scalar statistics are authoritative for totals and latency.  The
+    trace does not contain a per-address hit/miss flag, so row annotations use
+    the configured two-way L1 geometry and the observed instruction/data
+    addresses to mirror the same cold/conflict decisions.
+    """
+    if configuration.get("memoryMode") != "cache":
+        data["cacheEvents"] = []
+        data["cacheReport"] = ""
+        return
+
+    dynamic = sorted(
+        data.get("dynamicInstructions", []),
+        key=lambda row: min((int(cycle) for cycle in row.get("cycles", {})),
+                            default=10 ** 12),
+    )
+    for row in dynamic:
+        row["cacheEvents"] = []
+
+    line_size = int(configuration["cacheLine"])
+    instruction_cache = CacheAccessTracker(
+        configuration["iCacheSize"], line_size)
+    data_cache = CacheAccessTracker(configuration["dCacheSize"], line_size)
+    events = []
+
+    # Minor fetches one complete line and reuses it until control flow moves
+    # to another line. Record only those real L1 requests, not every opcode.
+    previous_fetch_line = None
+    for row in dynamic:
+        if not row.get("address") or not row.get("cycles"):
+            continue
+        address = int(row["address"], 16)
+        fetch_line = address - address % line_size
+        if fetch_line == previous_fetch_line:
+            continue
+        prior_fetch_line = previous_fetch_line
+        previous_fetch_line = fetch_line
+        hit, line_address, reason, resident_lines = instruction_cache.access(address)
+        fetch_cycles = [int(cycle) for cycle, stage in row["cycles"].items()
+                        if stage == "F"]
+        event = {
+            "cache": "I", "result": "hit" if hit else "miss",
+            "access": "fetch", "address": f"0x{address:x}",
+            "lineAddress": f"0x{line_address:x}",
+            "label": f"0x{address:x}",
+            "reason": reason,
+            "previousLineAddress": (f"0x{prior_fetch_line:x}"
+                                    if prior_fetch_line is not None else None),
+            "residentLines": [f"0x{line:x}" for line in resident_lines],
+            "cycle": min(fetch_cycles, default=0),
+            "stageCells": len(fetch_cycles),
+            "waitCells": sum(stage == "S" for stage in row["cycles"].values()),
+        }
+        row["cacheEvents"].append(event)
+        events.append(event)
+
+    # Exec supplies effective addresses and the instruction PC. Queue them by
+    # PC so repeated loop instructions are matched to the correct occurrence.
+    memory_by_pc = defaultdict(deque)
+    for cycle, changes in sorted(data.get("memoryDeltas", {}).items(),
+                                 key=lambda item: int(item[0])):
+        for address, details in changes.items():
+            memory_by_pc[details.get("pc", "").lower()].append(
+                (int(cycle), int(address, 16), details))
+    for row in dynamic:
+        pc = "0x" + row.get("address", "").lower()
+        if not memory_by_pc[pc]:
+            continue
+        _event_cycle, address, details = memory_by_pc[pc].popleft()
+        hit, line_address, reason, resident_lines = data_cache.access(address)
+        memory_cycles = [int(cycle) for cycle, stage in row["cycles"].items()
+                         if stage == "M"]
+        event = {
+            "cache": "D", "result": "hit" if hit else "miss",
+            "access": details.get("access", "access"),
+            "address": f"0x{address:x}",
+            "lineAddress": f"0x{line_address:x}",
+            "label": cache_symbol_label(address, symbols),
+            "reason": reason,
+            "residentLines": [f"0x{line:x}" for line in resident_lines],
+            "cycle": min(memory_cycles, default=_event_cycle),
+            "stageCells": len(memory_cycles),
+            "waitCells": 0,
+        }
+        row["cacheEvents"].append(event)
+        events.append(event)
+
+    statistics = gem5_statistics(result_dir / "stats.txt")
+    clock_ticks = statistics.get("system.cpu_clk_domain.clock", 0)
+
+    def cache_total(cache, metric):
+        return int(statistics.get(
+            f"system.cpu.{cache}.demand{metric}::total", 0))
+
+    def cache_timing(cache):
+        accesses = cache_total(cache, "Accesses")
+        hits = cache_total(cache, "Hits")
+        misses = cache_total(cache, "Misses")
+        latency_ticks = statistics.get(
+            f"system.cpu.{cache}.demandAvgMissLatency::total", 0)
+        total_latency_ticks = statistics.get(
+            f"system.cpu.{cache}.demandMissLatency::total", 0)
+        latency = latency_ticks / clock_ticks if clock_ticks else 0
+        return {
+            "accesses": accesses,
+            "hits": hits,
+            "averageTicks": latency_ticks,
+            "totalTicks": total_latency_ticks,
+            "cycles": latency,
+            "misses": misses,
+        }
+
+    cache_timings = {
+        "I": cache_timing("icache"),
+        "D": cache_timing("dcache"),
+    }
+    misses = sorted(
+        (event for event in events if event["result"] == "miss"),
+        key=lambda event: (event["cycle"], event["cache"]),
+    )
+    report = ["Cache miss summary:"]
+
+    def line_range(line_address):
+        start = int(line_address, 16)
+        return f"0x{start:x}–0x{start + line_size - 1:x}"
+
+    for event in misses:
+        requested_range = line_range(event["lineAddress"])
+        if event["cache"] == "I":
+            previous = event.get("previousLineAddress")
+            if previous is None:
+                explanation = "no instruction line was resident yet"
+            else:
+                explanation = (
+                    f"PC {event['address']} is outside the previous fetch line "
+                    f"{line_range(previous)}")
+            subject = f"instruction {event['address']}"
+        else:
+            resident = event.get("residentLines", [])
+            if resident:
+                ranges = ", ".join(line_range(line) for line in resident[-3:])
+                if len(resident) > 3:
+                    ranges = f"{ranges} (+{len(resident) - 3} more)"
+                explanation = f"requested line was not among resident lines {ranges}"
+            else:
+                explanation = "no data line was resident yet"
+            subject = f"{event['access']} {event['label']} at {event['address']}"
+        occupancy = f"{event['stageCells']} {event['cache'] == 'I' and 'F' or 'M'}"
+        if event.get("waitCells"):
+            occupancy += f" + {event['waitCells']} S"
+        miss_reason = ("first access to this line"
+                       if event["reason"].startswith("cold miss")
+                       else event["reason"])
+        report.append(
+            f"  cycle {event['cycle']}: {event['cache']}$ miss — {subject}; "
+            f"{line_size}-byte line {requested_range}; {explanation}; "
+            f"{miss_reason}; pipeline {occupancy}.")
+
+    if clock_ticks and any(timing["misses"] for timing in cache_timings.values()):
+        lookup = configuration["cacheLatency"]
+        memory = configuration["memoryLatency"]
+        response = configuration["cacheLatency"]
+        reference = (cache_timings["I"]["cycles"]
+                     or cache_timings["D"]["cycles"])
+        transport = max(0, reference - lookup - memory - response)
+        first_i_miss = next((event for event in misses
+                             if event["cache"] == "I"
+                             and event["result"] == "miss"), None)
+        d_miss_cells = [event["stageCells"] for event in misses
+                        if event["cache"] == "D"]
+        timing_summary = [
+            "",
+            "Timing explanation:",
+            (f"  • L1 lookup ({lookup} cycles): when the CPU sends a cache "
+             "request, L1 checks the address tag to find the requested "
+             f"{line_size}-byte line."),
+            (f"  • Main memory ({memory} cycles): after a miss, the missing "
+             "line is read from the backing memory."),
+            (f"  • L1 response ({response} cycles): the returned line is "
+             "installed in L1 and delivered to the CPU."),
+            (f"  • gem5 transport ({transport:g} cycles here): the request and "
+             "response cross the simulated interconnect and are aligned with "
+             "CPU clock events."),
+            (f"Therefore one uncontended miss needs {lookup} + {memory} + "
+             f"{response} + {transport:g} = {reference:g} service cycles."),
+        ]
+        if first_i_miss:
+            timing_summary.append(
+                f"The first instruction shows {first_i_miss['stageCells']} F "
+                f"cells: one F cell starts the request, followed by "
+                f"{reference:g} cache-miss service cycles.")
+        if d_miss_cells:
+            shown = ", ".join(map(str, d_miss_cells))
+            timing_summary.append(
+                f"The D$ misses occupy {shown} M cells. The first M cell is "
+                "the address-translation, LSQ, and D-cache request/handoff "
+                f"cycle; the following cells show the cache service. Thus an "
+                f"uncontended miss uses 1 request + {reference:g} service "
+                "cycles.")
+            timing_summary.append(
+                f"An uncontended cache hit skips main memory and needs only "
+                f"the {lookup}-cycle L1 lookup. A load hit therefore normally "
+                f"appears as {lookup} M cells before W.")
+            if max(d_miss_cells) > min(d_miss_cells):
+                timing_summary.append(
+                    "Lower-memory connection: I$ and D$ are separate L1 "
+                    "caches, but both connect to the same interconnect and "
+                    "backing memory below L1. If an instruction miss and a "
+                    "data miss arrive together, the interconnect must "
+                    "arbitrate between them; one request can wait an extra "
+                    "cycle. That is why the final D$ miss has one more M cell.")
+        report.extend(timing_summary)
+
+    data["cacheEvents"] = events
+    data["cacheReport"] = "\n".join(report)
+    data["instructions"] = compact_iterations(dynamic)
 
 
 def normalize_non_cache_memory_rows(data, configuration):
@@ -2001,14 +2491,17 @@ def normalize_forwarded_dependencies(data, configuration):
 
 
 def schedule_direct_in_order_pipeline(data, configuration):
-    """Schedule the Direct-1 teaching pipeline with a real scoreboard.
+    """Schedule the direct-memory teaching pipeline with a real scoreboard.
 
     MinorCPU exposes implementation-specific buffer waits in its trace.  For
-    Direct-1, Studio instead presents the five-stage pipeline used in class:
+    direct memory, Studio instead presents the five-stage pipeline used in
+    class and applies the selected fixed instruction/read/write latencies:
 
     * instructions enter execution in program order, at most one per cycle;
+    * an instruction remains in F for the configured instruction latency;
     * the integer/address, FP ALU, FP multiply, and FP divide units are
       independent;
+    * a load/store remains in M for its configured data latency;
     * a memory instruction keeps the address unit until it reaches M;
     * each arithmetic unit observes its configured pipelined/non-pipelined
       issue interval;
@@ -2021,10 +2514,7 @@ def schedule_direct_in_order_pipeline(data, configuration):
     diagrams used by the course.
     """
     if (configuration["cpu"] != "in-order"
-            or configuration["memoryMode"] != "direct"
-            or any(configuration[key] != 1 for key in (
-                "instructionMemoryLatency", "dataReadLatency",
-                "dataWriteLatency"))):
+            or configuration["memoryMode"] != "direct"):
         return False
     dynamic = data.get("dynamicInstructions", [])
     if not dynamic:
@@ -2153,7 +2643,7 @@ def schedule_direct_in_order_pipeline(data, configuration):
     def forwarded_ready(producer):
         # A load produces its value at the end of M; other functional units
         # may forward as they enter M.
-        return producer["M"] + (1 if producer["load"] else 0)
+        return producer["MEnd"] + (1 if producer["load"] else 0)
 
     for index, row in enumerate(executed):
         info = instruction_info(row["instruction"])
@@ -2166,7 +2656,7 @@ def schedule_direct_in_order_pipeline(data, configuration):
             # current one leaves Decode.
             fetch = previous["D"]
 
-        decode = fetch + 1
+        decode = fetch + configuration["instructionMemoryLatency"]
         if previous is not None:
             decode = max(decode, previous["E"])
 
@@ -2200,12 +2690,23 @@ def schedule_direct_in_order_pipeline(data, configuration):
             producer = latest_producer.get(info["storeData"])
             if producer is not None:
                 store_data_ready = (producer["W"] + 1 if not forwarding
-                                    else producer["M"] + 1)
+                                    else forwarded_ready(producer))
                 memory = max(memory, store_data_ready)
-        while memory in memory_stage_busy:
+        if info["load"]:
+            memory_latency = configuration["dataReadLatency"]
+        elif info["store"]:
+            memory_latency = configuration["dataWriteLatency"]
+        else:
+            memory_latency = 1
+        # Direct memory is a single non-pipelined M stage.  A load/store owns
+        # it for its complete configured latency, and even an ordinary
+        # instruction cannot pass through M until that interval has ended.
+        while any(cycle in memory_stage_busy
+                  for cycle in range(memory, memory + memory_latency)):
             memory += 1
-        writeback = memory + 1
-        memory_stage_busy.add(memory)
+        memory_end = memory + memory_latency - 1
+        writeback = memory_end + 1
+        memory_stage_busy.update(range(memory, memory_end + 1))
 
         record = {
             **info,
@@ -2215,6 +2716,7 @@ def schedule_direct_in_order_pipeline(data, configuration):
             "E": execute,
             "EEnd": execute_end,
             "M": memory,
+            "MEnd": memory_end,
             "W": writeback,
         }
         scheduled[id(row)] = record
@@ -2237,11 +2739,15 @@ def schedule_direct_in_order_pipeline(data, configuration):
         timing = scheduled[id(row)]
         cycles = {str(cycle): "S"
                   for cycle in range(timing["F"], timing["W"] + 1)}
-        cycles[str(timing["F"])] = "F"
+        fetch_end = (timing["F"]
+                     + configuration["instructionMemoryLatency"] - 1)
+        for cycle in range(timing["F"], fetch_end + 1):
+            cycles[str(cycle)] = "F"
         cycles[str(timing["D"])] = "D"
         for cycle in range(timing["E"], timing["EEnd"] + 1):
             cycles[str(cycle)] = "E"
-        cycles[str(timing["M"])] = "M"
+        for cycle in range(timing["M"], timing["MEnd"] + 1):
+            cycles[str(cycle)] = "M"
         cycles[str(timing["W"])] = "W"
         row["cycles"] = cycles
 
@@ -2376,7 +2882,7 @@ def normalize_in_order_taken_branches(data, configuration):
 
 
 def fill_in_order_stall_gaps(data, configuration):
-    """Apply the legacy visualizer's final in-order rendering invariant."""
+    """Fill in-order holds and identify otherwise-unlabelled memory requests."""
     if configuration["cpu"] != "in-order":
         return
     dynamic = data.get("dynamicInstructions", [])
@@ -2386,7 +2892,28 @@ def fill_in_order_stall_gaps(data, configuration):
         occupied = sorted(int(cycle) for cycle in row.get("cycles", {}))
         if not occupied:
             continue
+        opcode = row["instruction"].strip().split(None, 1)[0].lower()
+        memory_access = bool(re.fullmatch(
+            r"(?:l(?:b|bu|h|hu|w|wu|d)|fl[wdq]|s[bhwdq]|fs[wdq])", opcode))
+        first_memory = min(
+            (int(cycle) for cycle, stage in row["cycles"].items()
+             if stage == "M"),
+            default=None,
+        )
+        execute_before_memory = max(
+            (int(cycle) for cycle, stage in row["cycles"].items()
+             if stage == "E"
+             and (first_memory is None or int(cycle) < first_memory)),
+            default=None,
+        )
         for cycle in range(occupied[0], occupied[-1] + 1):
+            if (configuration.get("memoryMode") == "cache"
+                    and memory_access and execute_before_memory is not None
+                    and first_memory is not None
+                    and execute_before_memory < cycle < first_memory
+                    and cycle in row.get("inferredGaps", [])):
+                row["cycles"][str(cycle)] = "M"
+                continue
             row["cycles"].setdefault(str(cycle), "S")
     data["instructions"] = compact_iterations(dynamic)
 
@@ -2470,6 +2997,8 @@ def pipeline(name):
                      if int(cycle) <= data["cycles"]}
     data["configuration"] = configuration
     data["dataSymbols"] = data_symbols(folder)
+    data["memoryMap"] = elf_memory_map(folder)
+    add_cache_analysis(data, configuration, result_dir, data["dataSymbols"])
     return data
 
 
@@ -2498,11 +3027,11 @@ def write_pipeline_csv(data, output, expand_loops=False):
     writer.writerow(["Pipeline summary", "Value"])
     writer.writerow(["Total cycles", statistics["cycles"]])
     writer.writerow(["Executed instructions", statistics["instructions"]])
-    writer.writerow(["Code size (bytes)", statistics["codeBytes"]])
+    writer.writerow(["Pipeline code size (bytes)", statistics["codeBytes"]])
     writer.writerow(["Stalls", statistics["stalls"]])
     writer.writerow(["CPI", statistics["cpi"]])
     writer.writerow([])
-    writer.writerow(["PC Address", "Instruction", "Control flow",
+    writer.writerow(["PC Address", "Instruction", "Control flow / cache",
                      *[f"Cycle {cycle}" for cycle in range(1, data["cycles"] + 1)]])
     for row in rows:
         row_cycles = [int(cycle) for cycle in row["cycles"]]
@@ -2514,10 +3043,20 @@ def write_pipeline_csv(data, output, expand_loops=False):
         targets = defaultdict(int)
         for jump in jumps:
             targets[jump["toAddress"]] += 1
-        flow = "; ".join(
+        flow_parts = [
             f"0x{row['address']} -> 0x{target}{f' x{count}' if count > 1 else ''}"
             for target, count in targets.items()
+        ]
+        cache_events = [event for event in row.get("cacheEvents", [])
+                        if int(event.get("cycle", 0)) <= data["cycles"]]
+        cache_groups = defaultdict(int)
+        for event in cache_events:
+            cache_groups[(event.get("cache"), event.get("result"))] += 1
+        flow_parts.extend(
+            f"{cache}$ {result}{f' x{count}' if count > 1 else ''}"
+            for (cache, result), count in cache_groups.items()
         )
+        flow = "; ".join(flow_parts)
         writer.writerow([f"0x{row['address']}", row["instruction"], flow,
                          *[row["cycles"].get(str(cycle), "")
                            for cycle in range(1, data["cycles"] + 1)]])
@@ -2559,6 +3098,9 @@ def pipeline_for_display(name):
         "tooLarge": True,
         "limit": display_limit,
         "csvPath": str(destination),
+        "cacheReport": data.get("cacheReport", ""),
+        "dataSymbols": data.get("dataSymbols", []),
+        "memoryMap": data.get("memoryMap", []),
         **pipeline_statistics(data),
     }
 
@@ -2958,7 +3500,8 @@ class Handler(SimpleHTTPRequestHandler):
                                        "protectedLines": protected_lines(source)})
             if url.path == "/api/symbols":
                 folder = project_dir(parse_qs(url.query).get("name", [""])[0])
-                return self.send_json({"symbols": data_symbols(folder)})
+                return self.send_json({"symbols": data_symbols(folder),
+                                       "memoryMap": elf_memory_map(folder)})
             if url.path == "/api/pipeline":
                 return self.send_json(pipeline_for_display(
                     parse_qs(url.query).get("name", [""])[0]))
@@ -3058,7 +3601,7 @@ class Handler(SimpleHTTPRequestHandler):
         except Exception as error:
             return self.send_json({"error": str(error)}, 500)
 TEMPLATE = "# Add an optional .data section here.\n\n# The text section contains the instructions that the CPU runs.\n.section .text\n# Make _start visible as the point where the program begins.\n.globl _start\n_start:\n\n    # Write your RISC-V assembly here.\n\n# The End block stops the program and returns control to the simulator.\nEnd:\n    li a0, 0\n    li a7, 93\n    ecall\n"
-MAKEFILE = "CC ?= gcc\nOBJDUMP ?= objdump\nCFLAGS := $$OPTIMIZATION_FLAGS -mcmodel=medlow -march=rv32imf -mabi=ilp32 -mno-relax -Wall -Wextra -nostdlib\nTARGET = $$program.elf\nASM = ./main.s\nall:\n\t$(CC) -o $(TARGET) $(ASM) $(CFLAGS)\n\t$(OBJDUMP) -d $(TARGET) > $$program.dump\nclean:\n\trm -f $(TARGET) $$program.dump\n"
+MAKEFILE = "ASM = ./main.s\ninclude ../demo.mk\n"
 
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8765

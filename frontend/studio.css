@@ -192,6 +192,10 @@ h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: v
 .jump-arrow { width: 100%; border: 0; padding: 2px 3px; background: transparent; color: #b45309; text-align: left; font: 600 10px/1.4 ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; }
 .jump-arrow:hover { background: #fef3c7; }
 .jump-label { display: block; width: 100%; padding: 2px 3px; color: #b45309; text-align: left; font: 600 10px/1.4 ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; }
+.cache-event { display: inline-block; max-width: 100%; padding: 3px 2px; text-align: left; font: 700 9px/1.4 ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; vertical-align: top; }
+.cache-event + .cache-event { margin-left: 3px; }
+.cache-miss { color: #b91c1c; }
+.cache-hit { color: #15803d; }
 .head { background: #eef4fb; z-index: 7; font-weight: 600; }
 .corner { z-index: 9; }
 .stage-F { background: #60a5fa; color: #0c2d5a; }
@@ -207,7 +211,26 @@ h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: v
 .pipeline-row.row-selected .cell { box-shadow: inset 0 2px #f59f00, inset 0 -2px #f59f00; }
 .pipeline-row.row-selected .inst, .pipeline-row.row-selected .address-cell, .pipeline-row.row-selected .flow-cell { background: #fff3bf; }
 #detail { flex: 0 0 31px; padding: 6px 12px; border-top: 1px solid var(--line); font-size: 12px; color: var(--muted); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-#memory { min-width: 0; min-height: 0; flex: 1; overflow: auto; padding: 12px; }
+#memory { min-width: 0; min-height: 0; flex: 1; overflow: hidden; }
+.memory-workspace { display: grid; grid-template-columns: minmax(0, 1fr) 175px; width: 100%; height: 100%; min-width: 0; min-height: 0; }
+.memory-content { min-width: 0; overflow: auto; padding: 12px; }
+#memory-map { min-width: 0; overflow: auto; padding: 10px; border-left: 1px solid var(--line); background: #f8fafc; }
+.memory-map-title { margin-bottom: 9px; color: #334155; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; }
+#memory-map-sections { display: flex; flex-direction: column; gap: 5px; }
+.memory-map-section { display: grid; gap: 3px; min-height: 62px; padding: 7px; border: 1px solid #94a3b8; border-left-width: 5px; border-radius: 5px; background: #fff; font: 10px/1.3 ui-monospace, monospace; }
+.memory-map-section strong { font-size: 12px; }
+.memory-map-section span { color: var(--muted); overflow-wrap: anywhere; }
+.memory-map-address { display: flex; justify-content: space-between; gap: 4px; color: #475569; }
+.memory-map-part { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 1px 6px; margin-top: 3px; padding: 4px; border: 1px solid rgba(100, 116, 139, .28); border-radius: 3px; background: rgba(100, 116, 139, .07); }
+.memory-map-part strong { min-width: 0; font-size: 9px; overflow-wrap: anywhere; }
+.memory-map-part span { text-align: right; white-space: nowrap; }
+.memory-map-part code { grid-column: 1 / -1; color: var(--muted); font-size: 9px; overflow-wrap: anywhere; }
+.memory-map-code { border-left-color: #2563eb; background: #eff6ff; }
+.memory-map-data { border-left-color: #16a34a; background: #f0fdf4; }
+.memory-map-read-only-data { border-left-color: #9333ea; background: #faf5ff; }
+.memory-map-zero-initialized-data { border-left-color: #d97706; background: #fffbeb; }
+.memory-map-allocated { border-left-color: #64748b; }
+.memory-map-empty { padding: 12px 4px; color: var(--muted); font-size: 11px; line-height: 1.4; }
 .memory-watch-controls { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; padding-bottom: 9px; border-bottom: 1px solid var(--line); }
 .memory-watch-controls form { display: flex; align-items: end; gap: 5px; }
 .memory-watch-controls label { display: grid; gap: 3px; color: var(--muted); font-size: 11px; }
@@ -241,6 +264,8 @@ dialog::backdrop { background: #0f172a73; }
 #cpu-form select, #cpu-form input[type="number"], #cpu-form input[type="text"] { border: 1px solid #b8c5d6; border-radius: 5px; padding: 7px; background: #fff; }
 #cpu-form fieldset { border: 1px solid var(--line); border-radius: 6px; }
 .units-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.floating-precision { display: grid; grid-template-columns: minmax(75px, 1fr) 152px; align-items: center; gap: 8px; margin-bottom: 10px; font-size: 11px; font-weight: 600; }
+.floating-precision select { width: 100%; min-width: 0; }
 .unit-fields { display: grid; gap: 9px; }
 .unit-heading, .unit-row { display: grid; grid-template-columns: minmax(75px, 1fr) 68px 72px; align-items: center; gap: 8px; }
 .unit-heading { color: var(--muted); font-size: 10px; font-weight: 600; }
@@ -381,6 +406,14 @@ html[data-theme="dark"] .memory-watch { color: #bfdbfe; background: #17365f; bor
 html[data-theme="dark"] .memory-watch button:hover { background: #244b78; }
 html[data-theme="dark"] .memory-symbol-color { --memory-symbol-color: hsl(var(--memory-symbol-hue) 78% 72%); }
 html[data-theme="dark"] #pipeline-diagram { background: #182233; }
+html[data-theme="dark"] #memory-map { background: #182233; }
+html[data-theme="dark"] .memory-map-title { color: #dbe5f1; }
+html[data-theme="dark"] .memory-map-section { color: #e5edf7; background: #111827; border-top-color: #475569; border-right-color: #475569; border-bottom-color: #475569; }
+html[data-theme="dark"] .memory-map-code { background: #172b49; }
+html[data-theme="dark"] .memory-map-data { background: #153629; }
+html[data-theme="dark"] .memory-map-read-only-data { background: #302044; }
+html[data-theme="dark"] .memory-map-zero-initialized-data { background: #3b2c13; }
+html[data-theme="dark"] .memory-map-address { color: #adbbcc; }
 html[data-theme="dark"] .diagram-detail { color: #adbbcc; }
 html[data-theme="dark"] .cell,
 html[data-theme="dark"] .address-cell,
@@ -402,6 +435,8 @@ html[data-theme="dark"] .pipeline-header .cell.future { background: #202d40; col
 html[data-theme="dark"] .jump-arrow { background: transparent; color: #fbbf24; }
 html[data-theme="dark"] .jump-arrow:hover { background: #493b16; }
 html[data-theme="dark"] .jump-label { color: #fbbf24; }
+html[data-theme="dark"] .cache-miss { color: #fca5a5; }
+html[data-theme="dark"] .cache-hit { color: #86efac; }
 html[data-theme="dark"] dialog::backdrop { background: #64748b99; }
 html[data-theme="dark"] .about-license { background: #182233; }
 html[data-theme="dark"] #environment-form,

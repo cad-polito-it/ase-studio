@@ -194,7 +194,7 @@ function highlightAsmLine(line) {
     .replace(/(^|\s)(\.[\w.]+)/g, '$1<span class="directive">$2</span>')
     .replace(/\b(x(?:[12]?\d|3[01]|0)|f(?:[12]?\d|3[01]|0)|zero|ra|sp|gp|tp|[ast]([0-9]|10|11)|ft(?:[0-9]|10|11)|fs(?:[0-9]|10|11)|fa[0-7])\b/g,
       '<span class="register">$&</span>')
-    .replace(/\b(addi?|sub|mul|div|rem|and|or|xor|sll|srl|sra|lui|auipc|lb|lh|lw|ld|sb|sh|sw|flw|fld|fsw|fsd|fadd\.s|fsub\.s|fmul\.s|fdiv\.s|fmv\.[wx]\.[wx]|beqz|bnez|beq|bne|blt|bge|bltu|bgeu|jal|jalr|j|jr|ret|call|li|la|mv|nop|ecall)\b/gi,
+    .replace(/\b(c[._][a-z][\w.]*|add|addi|sub|sll|slli|slt|slti|sltu|sltiu|xor|xori|srl|srli|sra|srai|or|ori|and|andi|lui|auipc|lb|lbu|lh|lhu|lw|lwu|ld|sb|sh|sw|sd|mul|mulh|mulhsu|mulhu|div|divu|rem|remu|flw|fld|fsw|fsd|f(?:add|sub|mul|div|min|max)\.[sd]|f(?:madd|msub|nmsub|nmadd)\.[sd]|fsqrt\.[sd]|fsgnj[nx]?\.[sd]|f(?:eq|lt|le|class)\.[sd]|fcvt\.(?:w|wu|l|lu|s|d)\.(?:w|wu|l|lu|s|d)|fmv\.(?:x\.w|w\.x)|(?:lr|sc|amo(?:swap|add|xor|and|or|min|max|minu|maxu))\.w|beqz|bnez|beq|bne|blt|bge|bltu|bgeu|jal|jalr|j|jr|ret|call|tail|li|la|mv|neg|not|seqz|snez|sltz|sgtz|csrrw|csrrs|csrrc|csrrwi|csrrsi|csrrci|csrr|csrw|csrs|csrc|csrwi|csrsi|csrci|rdcycle|rdtime|rdinstret|fence\.i|fence|nop|ecall|ebreak|wfi|mret)\b/gi,
       '<span class="opcode">$&</span>')
     .replace(/^\s*([\w.]+):/, '<span class="label">$1</span>:');
 
@@ -356,6 +356,7 @@ async function openProject(name, {skipUnsavedCheck = false} = {}) {
     api("/api/symbols?name=" + encodedName).catch(() => ({symbols: []}))
   ]);
   opened.dataSymbols = symbolData.symbols || [];
+  opened.memoryMap = symbolData.memoryMap || [];
   current = opened;
   loadMemoryWatches();
   selectedSourceLine = null;
@@ -575,6 +576,9 @@ async function submitAssignment() {
     updateLog();
     if (result.ok) {
       const trace = await api("/api/pipeline?name=" + encodeURIComponent(current.name));
+      appendCacheReport(trace);
+      current.dataSymbols = trace.dataSymbols || [];
+      current.memoryMap = trace.memoryMap || [];
       if (trace.tooLarge) {
         pipelineData = null;
         playbackCycle = null;
@@ -588,7 +592,6 @@ async function submitAssignment() {
         showTab("output");
       } else {
         pipelineData = trace;
-        current.dataSymbols = trace.dataSymbols || [];
         playbackCycle = pipelineData.cycles;
         selectedColumn = null;
         stepMode = false;
@@ -665,6 +668,9 @@ async function run(stepAfterRun = false) {
     updateLog();
     if (result.ok) {
       const trace = await api("/api/pipeline?name=" + encodeURIComponent(current.name));
+      appendCacheReport(trace);
+      current.dataSymbols = trace.dataSymbols || [];
+      current.memoryMap = trace.memoryMap || [];
       if (trace.tooLarge) {
         pipelineData = null;
         playbackCycle = null;
@@ -678,7 +684,6 @@ async function run(stepAfterRun = false) {
         showTab("output");
       } else {
         pipelineData = trace;
-        current.dataSymbols = trace.dataSymbols || [];
         playbackCycle = stepAfterRun ? 1 : pipelineData.cycles;
         selectedRow = null;
         selectedColumn = stepAfterRun ? 1 : null;
@@ -732,32 +737,35 @@ function resetSimulation() {
   showTab("pipeline");
 }
 
-function formatWordValue(value, format) {
+function formatWordValue(value, format, width = 32) {
   let bits;
   try {
-    bits = BigInt.asUintN(32, BigInt(value || 0));
+    bits = BigInt.asUintN(width, BigInt(value || 0));
   } catch (_error) {
     bits = 0n;
   }
   switch (format) {
     case "binary":
-      return "0b" + bits.toString(2).padStart(32, "0");
+      return "0b" + bits.toString(2).padStart(width, "0");
     case "signed":
-      return BigInt.asIntN(32, bits).toString();
+      return BigInt.asIntN(width, bits).toString();
     case "unsigned":
       return bits.toString();
     case "float": {
-      const buffer = new ArrayBuffer(4);
+      const singlePrecision = width === 32;
+      const floatBits = singlePrecision ? BigInt.asUintN(32, bits) : bits;
+      const buffer = new ArrayBuffer(singlePrecision ? 4 : 8);
       const view = new DataView(buffer);
-      view.setUint32(0, Number(bits), false);
-      const number = view.getFloat32(0, false);
+      if (singlePrecision) view.setUint32(0, Number(floatBits), false);
+      else view.setBigUint64(0, floatBits, false);
+      const number = singlePrecision ? view.getFloat32(0, false) : view.getFloat64(0, false);
       if (Number.isNaN(number)) return "NaN";
       if (!Number.isFinite(number)) return number < 0 ? "-Infinity" : "Infinity";
       if (Object.is(number, -0)) return "-0";
       return Number(number.toPrecision(8)).toString();
     }
     default:
-      return "0x" + bits.toString(16).padStart(8, "0");
+      return "0x" + bits.toString(16).padStart(width / 4, "0");
   }
 }
 
@@ -790,14 +798,15 @@ function renderRegisters() {
   }
   const integerAbi = ["zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2", "s0/fp", "s1", "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "t3", "t4", "t5", "t6"];
   const floatAbi = ["ft0", "ft1", "ft2", "ft3", "ft4", "ft5", "ft6", "ft7", "fs0", "fs1", "fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7", "fs2", "fs3", "fs4", "fs5", "fs6", "fs7", "fs8", "fs9", "fs10", "fs11", "ft8", "ft9", "ft10", "ft11"];
-  const renderColumn = (prefix, aliases, format) => aliases.map((alias, index) => {
+  const renderColumn = (prefix, aliases, format, width) => aliases.map((alias, index) => {
     const name = `${prefix}${index}`;
-    return `<div class="register-value${changed.has(name) ? " changed" : ""}"><strong>${name}</strong><span>${alias}</span><code>${formatWordValue(state[name] || 0, format)}</code></div>`;
+    return `<div class="register-value${changed.has(name) ? " changed" : ""}"><strong>${name}</strong><span>${alias}</span><code>${formatWordValue(state[name] || 0, format, width)}</code></div>`;
   }).join("");
   $("#pipeline-pc").textContent = `PC ${pc}`;
   $("#pipeline-pc").classList.toggle("changed", pcChanged);
-  integerContainer.innerHTML = renderColumn("x", integerAbi, $("#integer-register-format").value);
-  floatContainer.innerHTML = renderColumn("f", floatAbi, $("#float-register-format").value);
+  const floatWidth = pipelineData.configuration?.floatingPointPrecision === "double" ? 64 : 32;
+  integerContainer.innerHTML = renderColumn("x", integerAbi, $("#integer-register-format").value, 32);
+  floatContainer.innerHTML = renderColumn("f", floatAbi, $("#float-register-format").value, floatWidth);
 }
 
 async function runStep() {
@@ -844,7 +853,10 @@ function renderPipelineDiagram() {
     : `Direct memory · I ${config.instructionMemoryLatency} · Read ${config.dataReadLatency} · Write ${config.dataWriteLatency} cycles`;
   const details = (o3
     ? `Fetch ${config.fetchWidth} · Decode ${config.decodeWidth}<br>Rename ${config.renameWidth} · Dispatch ${config.dispatchWidth}<br>Issue ${config.issueWidth} · WB ${config.writebackWidth}<br>Commit ${config.commitWidth}<br>ROB ${config.robEntries} · IQ ${config.iqEntries}<br>LQ ${config.lqEntries} · SQ ${config.sqEntries}`
-    : `Forwarding: ${config.forwarding ? "on" : "off"}`) + `<br>${memoryDetails}`;
+    : `Forwarding: ${config.forwarding ? "on" : "off"}`)
+    + `<br>Floating point: ${config.floatingPointPrecision === "double" ? "double (64-bit)" : "single (32-bit)"}`
+    + `<br>Compressed instructions: ${config.compressedInstructions ? "on" : "off"}`
+    + `<br>${memoryDetails}`;
   $("#pipeline-diagram").innerHTML = `<div class="diagram-title">${o3 ? "Out-of-order" : "In-order"} stages</div>${blocks}<div class="diagram-detail">${details}</div>`;
 }
 
@@ -926,9 +938,29 @@ function renderMemoryWatchControls(symbols) {
   $("#memory-watch-clear").disabled = memoryWatches.length === 0;
 }
 
+function renderMemoryMap() {
+  const container = $("#memory-map-sections");
+  const sections = pipelineData?.memoryMap?.length
+    ? pipelineData.memoryMap : (current?.memoryMap || []);
+  if (!sections.length) {
+    container.innerHTML = '<div class="memory-map-empty">Build the project to see its allocated ELF sections.</div>';
+    return;
+  }
+  const ordered = [...sections].sort((left, right) =>
+    BigInt(left.start) < BigInt(right.start) ? 1 : -1);
+  container.innerHTML = ordered.map(section => {
+    const type = String(section.kind || "allocated").replaceAll(" ", "-");
+    const parts = [...(section.parts || [])].reverse().map(part =>
+      `<div class="memory-map-part"><strong>${escapeHtml(part.name)}</strong><span>${Number(part.size).toLocaleString()} bytes</span><code>${escapeHtml(part.start)}–${escapeHtml(part.end)}</code></div>`
+    ).join("");
+    return `<div class="memory-map-section memory-map-${escapeHtml(type)}" title="${escapeHtml(`${section.name}: ${section.start}–${section.end}`)}"><div class="memory-map-address"><span>End</span><code>${escapeHtml(section.end)}</code></div><strong>${escapeHtml(section.name)}</strong><span>${escapeHtml(section.kind)} · ${Number(section.size).toLocaleString()} bytes</span>${parts}<div class="memory-map-address"><span>Begin</span><code>${escapeHtml(section.start)}</code></div></div>`;
+  }).join("");
+}
+
 function renderMemory() {
   const table = $("#memory-table");
   const symbols = availableMemorySymbols();
+  renderMemoryMap();
   renderMemoryWatchControls(symbols);
   if (!pipelineData || playbackCycle === null) {
     $("#memory-summary").textContent = memoryWatches.length
@@ -994,7 +1026,7 @@ function renderMemory() {
     const description = symbolFor(address);
     const color = description.symbol ? " memory-symbol-color" : "";
     const style = description.symbol ? ` style="--memory-symbol-hue:${memorySymbolHue(description.symbol, symbols)}deg"` : "";
-    const value = event ? formatWordValue(event.value, $("#memory-format").value) : "—";
+    const value = event ? formatWordValue(event.value, $("#memory-format").value, Number(event.bits) || 32) : "—";
     return `<div class="memory-value${color}${changed.has(address) ? " changed" : ""}"${style}><strong class="memory-symbol-name">${escapeHtml(description.label)}</strong><span class="memory-address">${address}</span><span>${event ? event.access : "not accessed"}</span><code>${value}</code></div>`;
   }).join("") : '<div class="memory-empty">No matching memory locations were found in this build.</div>';
 }
@@ -1027,6 +1059,26 @@ function jumpsForPipelineRow(row, lastVisibleCycle, expanded = expandedLoopView(
     grouped.set(jump.toAddress, entry);
   });
   return [...grouped.values()];
+}
+
+function cacheEventsForPipelineRow(row, lastVisibleCycle) {
+  const grouped = new Map();
+  (row.cacheEvents || []).filter(event =>
+    Number(event.cycle) <= lastVisibleCycle
+  ).forEach(event => {
+    const key = `${event.cache}:${event.result}`;
+    const entry = grouped.get(key) || {...event, count: 0};
+    entry.count += 1;
+    grouped.set(key, entry);
+  });
+  return [...grouped.values()];
+}
+
+function appendCacheReport(trace) {
+  if (!trace?.cacheReport) return;
+  lastNormalLog += `\n\n${trace.cacheReport}`;
+  lastAdvancedLog += `\n\n${trace.cacheReport}`;
+  updateLog();
 }
 
 function jumpTargetRow(rows, address, afterCycle = 0) {
@@ -1074,14 +1126,14 @@ function renderPipeline() {
   const visibleCycle = playbackCycle === null ? data.cycles : playbackCycle;
   const cpi = dynamicRows.length ? (data.cycles / dynamicRows.length).toFixed(2) : "—";
   const codeBytes = data.codeBytes ?? new Set(data.instructions.map(row => row.address)).size * 4;
-  $("#pipeline-summary").textContent = `${displayRows.length} instructions · ${codeBytes} bytes code · CPI ${cpi}`;
+  $("#pipeline-summary").textContent = `${displayRows.length} instructions · ${codeBytes} bytes pipeline code · CPI ${cpi}`;
   updateCycleNavigation();
   grid.style.width = totalWidth + "px";
 
   let header = `<div class="pipeline-header" style="grid-template-columns:${columns};width:${totalWidth}px">`;
   header += '<div class="cell address-cell head corner">PC Address</div>';
   header += '<div class="cell inst head corner">Instruction</div>';
-  header += '<div class="cell flow-cell head corner">Control flow</div>';
+  header += '<div class="cell flow-cell head corner" title="Control-flow transfers and cache misses">Control / cache</div>';
   for (let cycle = 1; cycle <= data.cycles; cycle++) {
     header += `<div class="cell head ${selectedColumn === cycle ? "column-selected" : ""}${cycle > visibleCycle ? " future" : ""}" data-col="${cycle}">${cycle}</div>`;
   }
@@ -1113,7 +1165,12 @@ function renderPipeline() {
         }
         return `<button class="jump-arrow" data-jump-target="${escapeHtml(jump.target)}" data-jump-cycle="${jump.cycles[0]}" title="Taken at cycle${jump.cycles.length > 1 ? "s" : ""} ${cycles}">${arrow} 0x${escapeHtml(jump.target)}${count}</button>`;
       }).join("");
-      html += `<div class="cell flow-cell" data-row="${rowIndex}">${jumpLinks}</div>`;
+      const cacheEvents = cacheEventsForPipelineRow(row, visibleCycle).map(event => {
+        const count = event.count > 1 ? ` ×${event.count}` : "";
+        const status = `${event.cache}$ ${event.result}`;
+        return `<span class="cache-event cache-${event.result}" title="${escapeHtml(`${status}; see Log Output for address and timing details`)}">${status}${count}</span>`;
+      }).join("");
+      html += `<div class="cell flow-cell" data-row="${rowIndex}">${jumpLinks}${cacheEvents}</div>`;
       for (let cycle = 1; cycle <= data.cycles; cycle++) {
         const stage = row.cycles[cycle] || "";
         const label = stage.length > 1 && stage !== "S" ? stage.split("").join("/") : stage;
@@ -1132,7 +1189,15 @@ function renderPipeline() {
     const stage = cell.dataset.stage;
     if (stage) {
       const row = displayRows[Number(cell.dataset.row)];
-      const stageName = stage === "S" ? "Pipeline stall / wait" : stage;
+      const stageNames = {
+        F: "Fetch",
+        D: "Decode",
+        E: "Execute",
+        M: "Memory access / request",
+        W: "Writeback",
+        S: "Pipeline stall / wait"
+      };
+      const stageName = stageNames[stage] || stage;
       $("#detail").textContent = `Instruction: ${row.instruction} | Cycle: ${cell.dataset.col} | Stage: ${stageName} | Iterations: ${row.iterations}`;
     } else {
       $("#detail").textContent = `Clock cycle ${cell.dataset.col}`;
@@ -1197,11 +1262,15 @@ function exportVisiblePipeline() {
     total + Object.values(row.cycles).filter(stage => stage === "S").length, 0);
   const instructionCount = dynamicRows.length;
   const cpi = instructionCount ? (pipelineData.cycles / instructionCount).toFixed(3) : "0";
-  const headers = ["PC Address", "Instruction", "Control flow"];
+  const headers = ["PC Address", "Instruction", "Control flow / cache"];
   for (let cycle = 1; cycle <= lastCycle; cycle++) headers.push(`Cycle ${cycle}`);
   const rows = displayedPipelineRows().map(row => {
-    const flow = jumpsForPipelineRow(row, lastCycle).map(jump =>
-      `0x${row.address} -> 0x${jump.target}${jump.cycles.length > 1 ? ` x${jump.cycles.length}` : ""}`).join("; ");
+    const flow = [
+      ...jumpsForPipelineRow(row, lastCycle).map(jump =>
+        `0x${row.address} -> 0x${jump.target}${jump.cycles.length > 1 ? ` x${jump.cycles.length}` : ""}`),
+      ...cacheEventsForPipelineRow(row, lastCycle).map(event =>
+        `${event.cache}$ ${event.result}${event.count > 1 ? ` x${event.count}` : ""}`)
+    ].join("; ");
     const values = [`0x${row.address}`, row.instruction, flow];
     for (let cycle = 1; cycle <= lastCycle; cycle++) values.push(row.cycles[String(cycle)] || "");
     return values;
@@ -1210,7 +1279,7 @@ function exportVisiblePipeline() {
     ["Pipeline summary", "Value"],
     ["Total cycles", pipelineData.cycles],
     ["Executed instructions", instructionCount],
-    ["Code size (bytes)", pipelineData.codeBytes || 0],
+    ["Pipeline code size (bytes)", pipelineData.codeBytes || 0],
     ["Stalls", stalls],
     ["CPI", cpi],
     []
@@ -1256,6 +1325,7 @@ async function openCpuConfiguration() {
     $("#float-alu").value = config.floatAlu;
     $("#float-mul").value = config.floatMul;
     $("#float-div").value = config.floatDiv;
+    $("#floating-point-precision").value = config.floatingPointPrecision || "single";
     $("#int-alu-pipelined").checked = config.intAluPipelined;
     $("#int-mul-pipelined").checked = config.intMulPipelined;
     $("#int-div-pipelined").checked = config.intDivPipelined;
@@ -1263,6 +1333,7 @@ async function openCpuConfiguration() {
     $("#float-mul-pipelined").checked = config.floatMulPipelined;
     $("#float-div-pipelined").checked = config.floatDivPipelined;
     $("#forwarding").checked = config.forwarding;
+    $("#compressed-instructions").checked = Boolean(config.compressedInstructions);
     $("#memory-mode").value = config.memoryMode === "cache" ? "cache" : "direct";
     $("#instruction-memory-latency").value = config.instructionMemoryLatency || 1;
     $("#data-read-latency").value = config.dataReadLatency || 1;
@@ -1698,6 +1769,7 @@ $("#cpu-form").onsubmit = async event => {
     floatAlu: Number($("#float-alu").value),
     floatMul: Number($("#float-mul").value),
     floatDiv: Number($("#float-div").value),
+    floatingPointPrecision: $("#floating-point-precision").value,
     intAluPipelined: $("#int-alu-pipelined").checked,
     intMulPipelined: $("#int-mul-pipelined").checked,
     intDivPipelined: $("#int-div-pipelined").checked,
@@ -1705,6 +1777,7 @@ $("#cpu-form").onsubmit = async event => {
     floatMulPipelined: $("#float-mul-pipelined").checked,
     floatDivPipelined: $("#float-div-pipelined").checked,
     forwarding: $("#forwarding").checked,
+    compressedInstructions: $("#compressed-instructions").checked,
     memoryMode: $("#memory-mode").value,
     cacheStalls: $("#memory-mode").value === "cache",
     instructionMemoryLatency: Number($("#instruction-memory-latency").value),
