@@ -12,6 +12,7 @@ import os
 import re
 import shlex
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -36,8 +37,8 @@ STUDIO_VERSION = (STUDIO_ROOT / "VERSION").read_text(encoding="utf-8").strip()
 ENVIRONMENT_CONFIG = ROOT / ".ase-studio-env.json"
 ENVIRONMENT_FIELDS = (
     "RISCV_TOOLCHAIN_PATH", "OPTIMIZATION_FLAGS", "GEM5_INSTALLATION_PATH",
-    "GEM5_ISA", "GEM5_VARIANT", "PIPELINE_DISPLAY_CYCLE_LIMIT",
-    "SUBMISSION_NAME_PREFIX", "SUBMISSION_NAME_SUFFIX",
+    "PIPELINE_DISPLAY_CYCLE_LIMIT", "SUBMISSION_NAME_PREFIX",
+    "SUBMISSION_NAME_SUFFIX",
 )
 OPTIONAL_ENVIRONMENT_FIELDS = {
     "OPTIMIZATION_FLAGS", "SUBMISSION_NAME_PREFIX", "SUBMISSION_NAME_SUFFIX",
@@ -53,7 +54,10 @@ PORTABLE_ENVIRONMENT_VARIABLES = {
 ASSIGNMENT_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
 STUDIO_API_VERSION = 2
 PIPELINE_DISPLAY_CYCLE_LIMIT = 3000
+GEM5_ISA = "RISCV"
+GEM5_VARIANT = "opt"
 OFFICIAL_GEM5_REPOSITORY = "github.com/cad-polito-it/gem5"
+REQUIRED_BRANCHES_FILE = ROOT / "ase_studio_branches.json"
 SCAFFOLD_COMMENTS = {
     "# The text section contains the instructions that the CPU runs.",
     "# Make _start visible as the point where the program begins.",
@@ -73,9 +77,12 @@ DEFAULT_CONFIG = {
     "iCacheSize": "32kB", "dCacheSize": "32kB", "cacheLine": 64,
     "cacheLatency": 2, "memoryLatency": 30,
     "fetchWidth": 2, "decodeWidth": 2, "renameWidth": 2,
-    "dispatchWidth": 2, "issueWidth": 2, "writebackWidth": 1,
+    "dispatchWidth": 2, "issueWidth": 2, "writebackWidth": 2,
     "commitWidth": 2, "robEntries": 64, "iqEntries": 128,
     "lqEntries": 32, "sqEntries": 32,
+    "o3VisibleStages": ["issue", "execute", "memory", "cdb", "commit"],
+    "branchPredictor": "local", "speculativeExecution": True,
+    "outOfOrderExecution": True, "o3EvaluationLabel": "",
 }
 
 
@@ -238,14 +245,47 @@ def validate_config(value):
                 "issueWidth", "writebackWidth", "commitWidth"):
         number = value.get(key, config[key])
         if not isinstance(number, int) or isinstance(number, bool) or not 1 <= number <= 8:
-            fail("O3 pipeline widths must be whole numbers from 1 to 8.")
+            fail("Multiple-issue pipeline widths must be whole numbers from 1 to 8.")
         config[key] = number
     for key, minimum, maximum in (("robEntries", 16, 512), ("iqEntries", 8, 2048),
                                   ("lqEntries", 4, 256), ("sqEntries", 4, 256)):
         number = value.get(key, config[key])
         if not isinstance(number, int) or isinstance(number, bool) or not minimum <= number <= maximum:
-            fail("O3 queue sizes contain an invalid value.")
+            fail("Multiple-issue queue sizes contain an invalid value.")
         config[key] = number
+    allowed_o3_stages = {
+        "fetch", "decode", "rename", "issue", "execute", "memory", "cdb", "commit"
+    }
+    visible_stages = value.get("o3VisibleStages", config["o3VisibleStages"])
+    if (not isinstance(visible_stages, list) or not visible_stages
+            or any(not isinstance(stage, str) or stage not in allowed_o3_stages
+                   for stage in visible_stages)
+            or len(set(visible_stages)) != len(visible_stages)):
+        fail("Select at least one valid multiple-issue pipeline stage to display.")
+    config["o3VisibleStages"] = [stage for stage in (
+        "fetch", "decode", "rename", "issue", "execute", "memory", "cdb", "commit"
+    ) if stage in visible_stages]
+    predictor_name = value.get("branchPredictor", config["branchPredictor"])
+    if predictor_name not in {"ideal", "local", "tournament", "bimode", "tage"}:
+        fail("Select a supported branch predictor.")
+    config["branchPredictor"] = predictor_name
+    speculation = value.get("speculativeExecution", config["speculativeExecution"])
+    if not isinstance(speculation, bool):
+        fail("The speculative-execution option must be enabled or disabled.")
+    config["speculativeExecution"] = speculation
+    out_of_order = value.get("outOfOrderExecution", config["outOfOrderExecution"])
+    if not isinstance(out_of_order, bool):
+        fail("The out-of-order execution option must be enabled or disabled.")
+    config["outOfOrderExecution"] = out_of_order
+    # Accept the former key while migrating existing per-project settings.
+    start_label = value.get(
+        "o3EvaluationLabel",
+        value.get("o3LectureStartLabel", config["o3EvaluationLabel"]),
+    )
+    if (not isinstance(start_label, str)
+            or (start_label and not re.fullmatch(r"[A-Za-z_.$][A-Za-z0-9_.$]*", start_label))):
+        fail("The evaluation start label is not a valid assembly label.")
+    config["o3EvaluationLabel"] = start_label
     if config["cacheLine"] & (config["cacheLine"] - 1):
         fail("Cache-line size must be a power of two.")
     if config["cpu"] == "out-of-order":
@@ -411,6 +451,11 @@ def settings_env():
     env["CC_INSTALLATION_PATH"] = str(compiler.parent) + os.sep
     env["GEM5_INSTALLATION_PATH"] = str(
         resolve_environment_path(env["GEM5_INSTALLATION_PATH"]))
+    # ASE Studio supports the RISC-V optimized gem5 build. Keeping these
+    # fixed avoids asking users for path components that are not choices in
+    # this frontend.
+    env["GEM5_ISA"] = GEM5_ISA
+    env["GEM5_VARIANT"] = GEM5_VARIANT
     env["GEM5_SIMULATION_SCRIPT"] = str(
         resolve_environment_path(env["GEM5_SIMULATION_SCRIPT"]))
     return env
@@ -641,12 +686,8 @@ def validate_environment_field(key, values):
     elif key in {"SUBMISSION_NAME_PREFIX", "SUBMISSION_NAME_SUFFIX"}:
         required = {key}
     else:
-        required = {"GEM5_INSTALLATION_PATH", "GEM5_ISA", "GEM5_VARIANT"}
+        required = {"GEM5_INSTALLATION_PATH"}
     cleaned = clean_environment_values(values, required)
-    for name in ("GEM5_ISA", "GEM5_VARIANT"):
-        if name in required and not re.fullmatch(r"[A-Za-z0-9_-]+", cleaned[name]):
-            label = name.replace("_", " ").lower()
-            fail(f"{label} may contain only letters, digits, '_' and '-'.")
 
     if key in {"RISCV_TOOLCHAIN_PATH", "OPTIMIZATION_FLAGS"}:
         compiler, objdump = toolchain_executables(cleaned["RISCV_TOOLCHAIN_PATH"])
@@ -677,7 +718,7 @@ def validate_environment_field(key, values):
                 else "No text will be added in this position.")
 
     gem5 = (resolve_environment_path(cleaned["GEM5_INSTALLATION_PATH"])
-            / cleaned["GEM5_ISA"] / f"gem5.{cleaned['GEM5_VARIANT']}")
+            / GEM5_ISA / f"gem5.{GEM5_VARIANT}")
     if not gem5.is_file() or not os.access(gem5, os.X_OK):
         fail(f"The gem5 executable does not exist or is not executable: {gem5}")
     return gem5_version(gem5)
@@ -801,7 +842,7 @@ def simulate(name):
             old_trace.unlink()
     in_order = cpu_config["cpu"] == "in-order"
     gem5 = (Path(configured_path(env["GEM5_INSTALLATION_PATH"]))
-            / env["GEM5_ISA"] / f"gem5.{env['GEM5_VARIANT']}")
+            / GEM5_ISA / f"gem5.{GEM5_VARIANT}")
     config = (configured_path(env["GEM5_SIMULATION_SCRIPT"]) if in_order
               else str(ROOT / "gem5" / "riscv_o3_custom.py"))
     latency_options = [
@@ -837,6 +878,12 @@ def simulate(name):
         "--ase-iq-entries", str(cpu_config["iqEntries"]),
         "--ase-lq-entries", str(cpu_config["lqEntries"]),
         "--ase-sq-entries", str(cpu_config["sqEntries"]),
+        # "ideal" is a teaching projection. A real local predictor produces
+        # the architectural trace, while the table deliberately applies no
+        # prediction misses or recovery penalty.
+        "--ase-branch-predictor", (
+            "local" if cpu_config["branchPredictor"] == "ideal"
+            else cpu_config["branchPredictor"]),
     ]
     if in_order:
         command = [str(gem5), "--debug-flags=MinorGUI,Exec", f"--outdir={result_dir}", "--verbose", config,
@@ -1076,6 +1123,7 @@ def compact_iterations(rows):
             target = {"instruction": row["instruction"], "address": row.get("address"),
                       "cycles": {}, "iterations": 0,
                       "squashedFetches": 0,
+                      "mispredictions": 0,
                       "cacheEvents": [],
                       "sourceLine": row.get("sourceLine")}
             by_address[key] = target
@@ -1086,6 +1134,8 @@ def compact_iterations(rows):
             target["squashedFetches"] += 1
         else:
             target["iterations"] += 1
+        if row.get("mispredicted"):
+            target["mispredictions"] += 1
         if target.get("sourceLine") is None:
             target["sourceLine"] = row.get("sourceLine")
     return compacted
@@ -1292,6 +1342,16 @@ def parse_o3(path: Path, source_body=""):
     stages = {"fetch": "F", "decode": "D", "rename": "R", "dispatch": "I", "issue": "E", "complete": "C", "retire": "W"}
     ticks = set()
     lines = path.read_text(errors="replace").splitlines()
+    # O3PipeView emits a row only when a DynInst object is destroyed. At
+    # simulation exit, a predictor-dependent number of already committed
+    # objects can still be retained in gem5 buffers. O3CPUAll records commit
+    # events immediately and is therefore the authoritative source for the
+    # complete teaching stream. Keep O3PipeView below for older traces that
+    # do not contain the sequence-numbered debug events.
+    debug_data = parse_o3_debug_trace(lines, source_body)
+    if any(not row.get("squashed")
+           for row in debug_data.get("dynamicInstructions", [])):
+        return debug_data
     for line in lines:
         parts = line.strip().split(":")
         if len(parts) < 3 or parts[0] != "O3PipeView":
@@ -1307,10 +1367,9 @@ def parse_o3(path: Path, source_body=""):
             value = stages[stage]
             existing = current["cycles"].get(key, "")
             current["cycles"][key] = existing + value if value not in existing else existing
-    rows = [row for row in rows
-            if any("W" in stage for stage in row["cycles"].values())]
+    rows = [row for row in rows if row["cycles"]]
     ticks = {int(tick) for row in rows for tick in row["cycles"]}
-    if not ticks:
+    if not rows or not ticks:
         return parse_o3_debug_trace(lines, source_body)
     sorted_ticks = sorted(ticks)
     intervals = [right - left for left, right in zip(sorted_ticks, sorted_ticks[1:]) if right > left]
@@ -1318,6 +1377,19 @@ def parse_o3(path: Path, source_body=""):
     for interval in intervals:
         tick_period = gcd(tick_period, interval) if tick_period > 1 else interval
     tick_period = max(1, tick_period)
+
+    # O3PipeView writes one record when a dynamic instruction is destroyed.
+    # A record without retire is a wrong-path instruction. The record has no
+    # explicit squash time, so place X immediately after its last reported
+    # stage; O3CPUAll's fallback parser uses the exact ROB squash event.
+    for row in rows:
+        if any("W" in stage for stage in row["cycles"].values()):
+            continue
+        row["squashed"] = True
+        squash_tick = max(int(tick) for tick in row["cycles"]) + tick_period
+        row["cycles"][str(squash_tick)] = "X"
+        ticks.add(squash_tick)
+    sorted_ticks = sorted(ticks)
     first_tick = sorted_ticks[0]
     ordered = {tick: ((tick - first_tick) // tick_period) + 1 for tick in sorted_ticks}
     for row in rows:
@@ -1368,6 +1440,476 @@ def complete_o3_waits(rows):
                     str(cycle), "C" if cycle == complete + 1 else "S")
 
 
+def schedule_lecture_o3_pipeline(data, configuration, start_address=None):
+    """Build the multiple-issue Tomasulo/ROB table used in the lectures.
+
+    gem5's trace remains the source of the committed dynamic instruction
+    stream and architectural values. This projection intentionally removes
+    gem5 front-end and time-buffer transport delays. With speculation off,
+    issue into the ROB/RS continues along the predicted path, but execution
+    of younger instructions waits until every older branch has resolved.
+    """
+    if data.get("format") != "o3":
+        return False
+
+    def first_cycle(row):
+        return min((int(cycle) for cycle in row.get("cycles", {})),
+                   default=10**12)
+
+    all_committed = sorted(
+        (row for row in data.get("dynamicInstructions", [])
+         if not row.get("squashed")),
+        key=first_cycle,
+    )
+    if start_address is not None:
+        start_index = next(
+            (index for index, row in enumerate(all_committed)
+             if row.get("address")
+             and int(row["address"], 16) == start_address),
+            None,
+        )
+        if start_index is None:
+            fail("The evaluation start label was not executed in this trace.")
+        committed = all_committed[start_index:]
+    else:
+        committed = all_committed
+    if not committed:
+        return False
+
+    original_cycles = {
+        id(row): sorted(int(cycle) for cycle in row.get("cycles", {}))
+        for row in all_committed
+    }
+
+    def instruction_info(instruction):
+        text_value = display_instruction(instruction).strip().lower()
+        parts = text_value.split(None, 1)
+        opcode = parts[0] if parts else ""
+        operands = parts[1] if len(parts) > 1 else ""
+        operands = re.sub(
+            r"\b(" + "|".join(map(re.escape, REGISTER_ALIASES)) + r")\b",
+            lambda match: REGISTER_ALIASES[match.group(1)], operands,
+        )
+        registers = [register for register in re.findall(r"\b[xf]\d+\b", operands)
+                     if register != "x0"]
+        load = bool(re.fullmatch(r"(?:l(?:b|bu|h|hu|w|wu|d)|fl[wdq])", opcode))
+        store = bool(re.fullmatch(r"(?:s[bhwdq]|fs[wdq])", opcode))
+        control = bool(re.fullmatch(
+            r"(?:b(?:eq|ne|lt|ge|ltu|geu)|j|jr|jal|jalr|ret)", opcode))
+        no_destination = store or opcode.startswith("b") or opcode in {"j", "jr", "ret"}
+        destination = registers[0] if registers and not no_destination else None
+        sources = registers if no_destination else registers[1:]
+        store_data = registers[0] if store and registers else None
+        execute_sources = registers[1:] if store else sources
+
+        if load or store:
+            unit, latency, pipelined = "address", 1, True
+        elif re.match(r"^fmul", opcode):
+            unit, latency, pipelined = (
+                "float-multiply", configuration["floatMul"],
+                configuration["floatMulPipelined"])
+        elif re.match(r"^fdiv", opcode):
+            unit, latency, pipelined = (
+                "float-divide", configuration["floatDiv"],
+                configuration["floatDivPipelined"])
+        elif re.match(r"^f", opcode):
+            unit, latency, pipelined = (
+                "float-alu", configuration["floatAlu"],
+                configuration["floatAluPipelined"])
+        elif re.match(r"^mul", opcode):
+            unit, latency, pipelined = (
+                "integer-multiply", configuration["intMul"],
+                configuration["intMulPipelined"])
+        elif re.match(r"^(?:div|rem)", opcode):
+            unit, latency, pipelined = (
+                "integer-divide", configuration["intDiv"],
+                configuration["intDivPipelined"])
+        else:
+            unit, latency, pipelined = (
+                "integer-alu", configuration["intAlu"],
+                configuration["intAluPipelined"])
+        return {
+            "opcode": opcode, "destination": destination, "sources": sources,
+            "storeData": store_data, "executeSources": execute_sources,
+            "load": load, "store": store, "control": control, "unit": unit,
+            "latency": max(1, int(latency)), "pipelined": bool(pipelined),
+        }
+
+    information = {}
+    for row in committed:
+        information[id(row)] = instruction_info(row["instruction"])
+
+    issue_width = max(1, int(configuration["dispatchWidth"]))
+    issue_cycles = {}
+    front_end_cycles = {}
+    visible_stages = set(configuration.get(
+        "o3VisibleStages", DEFAULT_CONFIG["o3VisibleStages"]))
+    show_front_end = bool(visible_stages & {"fetch", "decode", "rename"})
+    if show_front_end:
+        stage_uses = {stage: defaultdict(int)
+                      for stage in ("F", "D", "R", "I")}
+
+        def reserve_front_stage(stage, earliest, width):
+            cycle = earliest
+            while stage_uses[stage][cycle] >= width:
+                cycle += 1
+            stage_uses[stage][cycle] += 1
+            return cycle
+
+        previous_stage = {stage: 1 for stage in ("F", "D", "R", "I")}
+        fetch_floor = issue_floor = 1
+        for row in committed:
+            info = information[id(row)]
+            fetch = reserve_front_stage(
+                "F", max(fetch_floor, previous_stage["F"]),
+                max(1, int(configuration["fetchWidth"])))
+            decode = reserve_front_stage(
+                "D", max(fetch + 1, previous_stage["D"]),
+                max(1, int(configuration["decodeWidth"])))
+            rename = reserve_front_stage(
+                "R", max(decode + 1, previous_stage["R"]),
+                max(1, int(configuration["renameWidth"])))
+            issue = reserve_front_stage(
+                "I", max(rename + 1, issue_floor, previous_stage["I"]),
+                issue_width)
+            front_end_cycles[id(row)] = {
+                "F": fetch, "D": decode, "R": rename,
+            }
+            issue_cycles[id(row)] = issue
+            previous_stage.update({
+                "F": fetch, "D": decode, "R": rename, "I": issue,
+            })
+            # The predicted successor of a control transfer enters Fetch and
+            # Issue no earlier than the following cycle.
+            if info["control"]:
+                fetch_floor = fetch + 1
+                issue_floor = issue + 1
+    else:
+        issue_cycle, issue_slots = 1, 0
+        for row in committed:
+            info = information[id(row)]
+            issue_cycles[id(row)] = issue_cycle
+            issue_slots += 1
+            # A predicted control transfer supplies its successor for the next
+            # cycle; it cannot share the remaining issue slot in this cycle.
+            if info["control"] or issue_slots >= issue_width:
+                issue_cycle += 1
+                issue_slots = 0
+
+    execution_width = max(1, int(configuration["issueWidth"]))
+    cdb_width = max(1, int(configuration["writebackWidth"]))
+    execution_starts = defaultdict(int)
+    cdb_uses = defaultdict(int)
+    unit_busy = defaultdict(set)
+    memory_busy = set()
+    latest_producer = {}
+    resolved_branches = []
+    timing = {}
+
+    def reserve_execution(info, earliest):
+        cycle = earliest
+        while True:
+            occupied = ({cycle} if info["pipelined"]
+                        else set(range(cycle, cycle + info["latency"])))
+            if (execution_starts[cycle] < execution_width
+                    and not (occupied & unit_busy[info["unit"]])):
+                execution_starts[cycle] += 1
+                unit_busy[info["unit"]].update(occupied)
+                return cycle
+            cycle += 1
+
+    def reserve_cdb(earliest):
+        cycle = earliest
+        while cdb_uses[cycle] >= cdb_width:
+            cycle += 1
+        cdb_uses[cycle] += 1
+        return cycle
+
+    speculation = bool(configuration.get("speculativeExecution", True))
+    out_of_order_execution = bool(
+        configuration.get("outOfOrderExecution", True))
+    previous_execution_start = 0
+    schedule_delay = 0
+    recovery_issue_floor = 0
+    for row in committed:
+        info = information[id(row)]
+        base_issue = issue_cycles[id(row)]
+        issue = max(base_issue + schedule_delay, recovery_issue_floor)
+        schedule_delay = max(schedule_delay, issue - base_issue)
+        effective_front_end = {
+            stage: cycle + schedule_delay
+            for stage, cycle in front_end_cycles.get(id(row), {}).items()
+        }
+        earliest = issue + 1
+        for register in info["executeSources"]:
+            producer = latest_producer.get(register)
+            if producer is not None and producer.get("C") is not None:
+                earliest = max(earliest, producer["C"] + 1)
+        if not speculation and resolved_branches:
+            earliest = max(earliest, max(resolved_branches) + 1)
+        if not out_of_order_execution:
+            # Multiple instructions may start together when the configured
+            # EXE width permits it, but no younger instruction may overtake
+            # an older instruction that is waiting for operands or a unit.
+            earliest = max(earliest, previous_execution_start)
+
+        execute = reserve_execution(info, earliest)
+        previous_execution_start = execute
+        execute_end = execute + info["latency"] - 1
+        memory_start = memory_end = None
+        if info["load"]:
+            memory_latency = (configuration["dataReadLatency"]
+                              if configuration["memoryMode"] == "direct"
+                              else configuration["cacheLatency"])
+            memory_start = execute_end + 1
+            while any(cycle in memory_busy for cycle in range(
+                    memory_start, memory_start + memory_latency)):
+                memory_start += 1
+            memory_end = memory_start + memory_latency - 1
+            memory_busy.update(range(memory_start, memory_end + 1))
+
+        produces_result = info["destination"] is not None
+        cdb = reserve_cdb((memory_end if info["load"] else execute_end) + 1) \
+            if produces_result else None
+        record = {
+            **info, "row": row, "I": issue, "E": execute,
+            "EEnd": execute_end, "M": memory_start, "MEnd": memory_end,
+            "C": cdb, "frontEnd": effective_front_end,
+            "storeDataProducer": latest_producer.get(info["storeData"]),
+        }
+        timing[id(row)] = record
+        if produces_result:
+            latest_producer[info["destination"]] = record
+        if info["control"]:
+            resolved_branches.append(execute_end)
+            if (configuration.get("branchPredictor") != "ideal"
+                    and row.get("mispredicted")):
+                # A simplified recovery retains the real predictor outcome:
+                # two Issue-level cycles, or Fetch plus D/R/I refill when the
+                # front end is visible. The following correct-path row cannot
+                # issue until recovery is complete.
+                recovery_cycles = 4 if show_front_end else 2
+                row["predictionPenalty"] = recovery_cycles
+                recovery_issue_floor = max(
+                    recovery_issue_floor, execute_end + recovery_cycles)
+
+    commit_width = max(1, int(configuration["commitWidth"]))
+    commit_uses = defaultdict(int)
+    previous_commit = 0
+    for row in committed:
+        current = timing[id(row)]
+        info = information[id(row)]
+        ready = ((current["C"] + 1) if current["C"] is not None
+                 else current["EEnd"] + 1)
+        if info["store"]:
+            producer = current["storeDataProducer"]
+            if producer is not None and producer.get("C") is not None:
+                ready = max(ready, producer["C"] + 1)
+        commit = max(ready, previous_commit)
+        while commit_uses[commit] >= commit_width:
+            commit += 1
+        commit_uses[commit] += 1
+        current["W"] = commit
+        previous_commit = commit
+
+    # Preserve actual architectural values but move their visible updates to
+    # lecture Commit (and load/store accesses to MEM/Commit respectively).
+    register_events = defaultdict(list)
+    for cycle, changes in data.get("registerDeltas", {}).items():
+        for register, value in changes.items():
+            register_events[register].append((int(cycle), value))
+    first_original_cycle = min(original_cycles[id(row)][0] for row in committed
+                               if original_cycles[id(row)])
+    initial_registers = {}
+    for register, events in register_events.items():
+        for cycle, value in sorted(events):
+            if cycle >= first_original_cycle:
+                break
+            initial_registers[register] = value
+    new_registers = defaultdict(dict)
+    used_register_events = set()
+    for row in committed:
+        info = information[id(row)]
+        destination = info["destination"]
+        if destination is None:
+            continue
+        bounds = original_cycles[id(row)]
+        for event_index, (cycle, value) in enumerate(register_events[destination]):
+            event_key = (destination, event_index)
+            if (event_key not in used_register_events and bounds
+                    and bounds[0] <= cycle <= bounds[-1] + 2):
+                new_registers[str(timing[id(row)]["W"])][destination] = value
+                used_register_events.add(event_key)
+                break
+
+    memory_events = defaultdict(deque)
+    for cycle, changes in sorted(data.get("memoryDeltas", {}).items(),
+                                 key=lambda item: int(item[0])):
+        for address, event in changes.items():
+            memory_events[event.get("pc", "")].append((address, event))
+    new_memory = defaultdict(dict)
+    for row in committed:
+        queue = memory_events["0x" + row.get("address", "")]
+        if not queue:
+            continue
+        address, event = queue.popleft()
+        current = timing[id(row)]
+        event_cycle = current["MEnd"] if information[id(row)]["load"] else current["W"]
+        if event_cycle is not None:
+            new_memory[str(event_cycle)][address] = event
+
+    for row in committed:
+        current = timing[id(row)]
+        info = information[id(row)]
+        first_cycle = current["frontEnd"].get("F", current["I"])
+        cycles = {str(cycle): "S" for cycle in range(first_cycle, current["W"] + 1)}
+        for stage, cycle in current["frontEnd"].items():
+            cycles[str(cycle)] = stage
+        cycles[str(current["I"])] = "I"
+        for cycle in range(current["E"], current["EEnd"] + 1):
+            cycles[str(cycle)] = "E"
+        if current["M"] is not None:
+            for cycle in range(current["M"], current["MEnd"] + 1):
+                cycles[str(cycle)] = "M"
+        if current["C"] is not None:
+            cycles[str(current["C"])] = "C"
+        cycles[str(current["W"])] = "MW" if info["store"] else "W"
+        row["cycles"] = cycles
+
+    branch_rows = defaultdict(deque)
+    for row in committed:
+        if information[id(row)]["control"]:
+            branch_rows[row.get("address")].append(row)
+    relocated_jumps = []
+    for jump in data.get("jumps", []):
+        candidates = branch_rows[jump.get("fromAddress")]
+        if candidates:
+            branch = candidates.popleft()
+            relocated_jumps.append({**jump, "cycle": timing[id(branch)]["EEnd"]})
+
+    displayed_rows = []
+    for row in committed:
+        displayed_rows.append(row)
+        penalty = row.get("predictionPenalty", 0)
+        if not penalty:
+            continue
+        resolution = timing[id(row)]["EEnd"]
+        displayed_rows.append({
+            "instruction": "predicted path (squashed)",
+            "address": None,
+            "cycles": {
+                str(cycle): "X"
+                for cycle in range(resolution, resolution + penalty)
+            },
+            "squashed": True,
+            "predictionRecovery": True,
+            "sourceLine": row.get("sourceLine"),
+        })
+
+    data["dynamicInstructions"] = displayed_rows
+    data["instructions"] = compact_iterations(displayed_rows)
+    data["registerDeltas"] = dict(new_registers)
+    data["initialRegisters"] = initial_registers
+    data["memoryDeltas"] = dict(new_memory)
+    data["jumps"] = relocated_jumps
+    data["cycles"] = max(current["W"] for current in timing.values())
+    data["lectureTimingApplied"] = True
+    return True
+
+
+def configure_o3_stage_display(data, configuration):
+    """Project gem5 O3 events onto the lecture-level speculative pipeline.
+
+    gem5 dispatch corresponds to the lectures' in-order Issue/Dispatch step;
+    gem5 issue starts out-of-order execution; complete is the CDB/write-result
+    event; and retire is in-order Commit. For memory operations, execution
+    cycles after address generation are labelled M. Hidden front-end stages
+    are removed from cells without changing instruction timing relative to
+    other instructions.
+    """
+    if data.get("format") != "o3":
+        return
+    visible = set(configuration.get("o3VisibleStages", DEFAULT_CONFIG["o3VisibleStages"]))
+    marker_stage = {
+        "F": "fetch", "D": "decode", "R": "rename", "I": "issue",
+        "E": "execute", "M": "memory", "C": "cdb", "W": "commit",
+        "S": "stall", "X": "squash",
+    }
+    load_opcode = re.compile(r"^(?:l(?:b|bu|h|hu|w|wu|d)|fl[wdq])$", re.I)
+    store_opcode = re.compile(r"^(?:s[bhwdq]|fs[wdq])$", re.I)
+    conditional_branch = re.compile(r"^b(?:eq|ne|lt|ge|ltu|geu)$", re.I)
+    rows = data.get("dynamicInstructions", [])
+    for row in rows:
+        opcode = display_instruction(row.get("instruction", "")).split(None, 1)[0]
+
+        # A CDB count is broadcast bandwidth, not result latency: one result
+        # occupies one C cell. Stores and control transfers do not write a
+        # register result on the CDB in the lecture-level Tomasulo model.
+        cdb_cycles = sorted(
+            int(cycle) for cycle, markers in row.get("cycles", {}).items()
+            if "C" in markers)
+        destination = destination_register(row.get("instruction", ""))
+        writes_register = (not store_opcode.match(opcode)
+                           and not conditional_branch.match(opcode)
+                           and destination not in {None, "x0"})
+        retained_cdb = 1 if writes_register else 0
+        for cycle in cdb_cycles[retained_cdb:]:
+            markers = row["cycles"][str(cycle)]
+            row["cycles"][str(cycle)] = markers.replace("C", "S")
+
+        # A load first calculates its address in EXE and then occupies MEM
+        # until its value can be broadcast. A store updates memory only when
+        # it commits, so show MEM and Commit together for that architectural
+        # event instead of inventing a store CDB write.
+        if load_opcode.match(opcode):
+            execute_cycles = sorted(
+                int(cycle) for cycle, markers in row.get("cycles", {}).items()
+                if "E" in markers)
+            for cycle in execute_cycles[1:]:
+                markers = row["cycles"][str(cycle)]
+                row["cycles"][str(cycle)] = markers.replace("E", "M")
+        elif store_opcode.match(opcode):
+            for cycle, markers in list(row.get("cycles", {}).items()):
+                if "W" in markers and "M" not in markers:
+                    row["cycles"][cycle] = markers.replace("W", "MW")
+
+        filtered = {}
+        for cycle, markers in row.get("cycles", {}).items():
+            kept = "".join(marker for marker in markers
+                           if marker_stage.get(marker) in visible
+                           or marker in {"S", "X"})
+            if kept:
+                filtered[cycle] = kept
+        row["cycles"] = filtered
+
+    occupied = [int(cycle) for row in rows for cycle in row.get("cycles", {})]
+    if not occupied:
+        return
+    offset = min(occupied) - 1
+
+    def shift_cycle_map(values):
+        return {str(int(cycle) - offset): value for cycle, value in values.items()
+                if int(cycle) > offset}
+
+    if offset:
+        for row in rows:
+            row["cycles"] = shift_cycle_map(row.get("cycles", {}))
+        for key in ("registerDeltas", "memoryDeltas"):
+            data[key] = shift_cycle_map(data.get(key, {}))
+        for jump in data.get("jumps", []):
+            jump["cycle"] = max(1, jump["cycle"] - offset)
+
+    # In an O3 view with Fetch hidden, associate the PC monitor with the
+    # instruction's first visible teaching stage instead of a hidden fetch.
+    data["pcDeltas"] = {
+        str(min(int(cycle) for cycle in row["cycles"])): "0x" + row["address"]
+        for row in rows if row.get("address") and row.get("cycles")
+    }
+    data["instructions"] = compact_iterations(rows)
+    data["cycles"] = max(
+        (int(cycle) for row in rows for cycle in row.get("cycles", {})), default=0)
+
+
 def parse_o3_debug_trace(lines, source_body=""):
     """Build an O3 timeline from O3CPUAll when O3PipeView emits no records.
 
@@ -1375,7 +1917,8 @@ def parse_o3_debug_trace(lines, source_body=""):
     A short program can finish while its committed instructions are still retained,
     leaving an otherwise useful trace with no O3PipeView lines.  O3CPUAll contains
     the same sequence-numbered stage transitions, so use those as a reliable
-    fallback and retain only instructions that reached commit.
+    fallback. Retain committed instructions and mark wrong-path speculative
+    instructions at the cycle in which the ROB squashes them.
     """
     exec_instructions = {}
     for line in lines:
@@ -1392,6 +1935,7 @@ def parse_o3_debug_trace(lines, source_body=""):
         row = rows.setdefault(sequence, {
             "instruction": exec_instructions.get(address, f"instruction @ 0x{address}"),
             "address": address,
+            "sequence": int(sequence),
             "ticks": {},
         })
         # Preserve both labels when zero-latency stages share a clock edge.
@@ -1416,9 +1960,34 @@ def parse_o3_debug_trace(lines, source_body=""):
                        int(match.group(1)), stage)
                 break
 
-    committed = [row for row in rows.values()
-                 if any("W" in stage for stage in row["ticks"].values())]
-    if not committed or not event_ticks:
+        misprediction = re.match(
+            r"^\s*(\d+): .*?(?:iew: .*?\[sn:(\d+)\] Execute: Branch "
+            r"mispredict detected|decode: .*?\[sn:(\d+)\] Squashing due to "
+            r"incorrect branch prediction detected at decode)",
+            line,
+        )
+        if misprediction:
+            tick, execute_sequence, decode_sequence = misprediction.groups()
+            sequence = execute_sequence or decode_sequence
+            row = rows.get(sequence)
+            if row is not None:
+                row["mispredicted"] = True
+                row["mispredictTick"] = int(tick)
+
+        squash = re.match(
+            r"^\s*(\d+): .*?rob: .*?Squashing instruction PC "
+            r"\(0x([0-9a-fA-F]+).*?seq num (\d+)\.",
+            line,
+        )
+        if squash:
+            tick, address, sequence = squash.groups()
+            record(sequence, address, int(tick), "X")
+            rows[sequence]["squashed"] = True
+
+    visible_rows = [row for row in rows.values()
+                    if row.get("squashed")
+                    or any("W" in stage for stage in row["ticks"].values())]
+    if not visible_rows or not event_ticks:
         return {"instructions": [], "dynamicInstructions": [], "cycles": 0,
                 "format": "o3", "registerDeltas": {},
                 "pcDeltas": {}, "memoryDeltas": {}, "jumps": []}
@@ -1429,11 +1998,11 @@ def parse_o3_debug_trace(lines, source_body=""):
     for interval in intervals[1:]:
         tick_period = gcd(tick_period, interval)
     tick_period = max(1, tick_period)
-    first_tick = min(min(row["ticks"]) for row in committed)
-    last_tick = max(max(row["ticks"]) for row in committed)
+    first_tick = min(min(row["ticks"]) for row in visible_rows)
+    last_tick = max(max(row["ticks"]) for row in visible_rows)
 
     dynamic_rows = []
-    for row in sorted(committed, key=lambda item: min(item["ticks"])):
+    for row in sorted(visible_rows, key=lambda item: min(item["ticks"])):
         cycles = {str(((tick - first_tick) // tick_period) + 1): stage
                   for tick, stage in row.pop("ticks").items()}
         row["cycles"] = cycles
@@ -1531,6 +2100,84 @@ def data_symbols(folder):
             "kind": symbol["kind"],
         })
     return symbols
+
+
+def elf_initial_memory(folder, symbols=None):
+    """Read initial watched values from ELF sections, including zeroed BSS.
+
+    Runtime traces only contain memory transactions. Seeding playback from
+    the linked image lets a student inspect a declared variable even when the
+    program never loads or stores it.
+    """
+    elf = folder / f"{artifact_stem(folder)}.elf"
+    if not elf.exists():
+        return {}
+    symbols = data_symbols(folder) if symbols is None else symbols
+    if not symbols:
+        return {}
+    try:
+        image = elf.read_bytes()
+        if image[:4] != b"\x7fELF" or image[5] not in {1, 2}:
+            return {}
+        elf_class = image[4]
+        endian = "<" if image[5] == 1 else ">"
+        if elf_class == 1:
+            section_offset = struct.unpack_from(endian + "I", image, 32)[0]
+            section_entry_size = struct.unpack_from(endian + "H", image, 46)[0]
+            section_count = struct.unpack_from(endian + "H", image, 48)[0]
+            section_format = endian + "IIIIIIIIII"
+        elif elf_class == 2:
+            section_offset = struct.unpack_from(endian + "Q", image, 40)[0]
+            section_entry_size = struct.unpack_from(endian + "H", image, 58)[0]
+            section_count = struct.unpack_from(endian + "H", image, 60)[0]
+            section_format = endian + "IIQQQQIIQQ"
+        else:
+            return {}
+        expected_size = struct.calcsize(section_format)
+        if section_entry_size < expected_size:
+            return {}
+        sections = []
+        for index in range(section_count):
+            offset = section_offset + index * section_entry_size
+            fields = struct.unpack_from(section_format, image, offset)
+            sections.append({
+                "type": fields[1], "address": fields[3],
+                "offset": fields[4], "size": fields[5],
+            })
+    except (OSError, IndexError, struct.error):
+        return {}
+
+    initial = {}
+    for symbol in symbols:
+        start = int(symbol["address"], 16)
+        size = max(1, min(int(symbol.get("size", 4)), 1024 * 1024))
+        section = next(
+            (candidate for candidate in sections
+             if candidate["address"] <= start
+             and start + size <= candidate["address"] + candidate["size"]),
+            None,
+        )
+        if section is None:
+            continue
+        for relative in range(0, size, 4):
+            byte_count = min(4, size - relative)
+            if section["type"] == 8:  # SHT_NOBITS (.bss/.sbss)
+                chunk = b"\0" * byte_count
+            else:
+                file_offset = (section["offset"] + start
+                               - section["address"] + relative)
+                chunk = image[file_offset:file_offset + byte_count]
+                if len(chunk) != byte_count:
+                    break
+            padded = chunk.ljust(4, b"\0")
+            byte_order = "little" if endian == "<" else "big"
+            value = int.from_bytes(padded, byteorder=byte_order, signed=False)
+            address = f"0x{start + relative:x}"
+            initial[address] = {
+                "value": f"0x{value:08x}", "access": "initial value",
+                "pc": "", "bits": 32,
+            }
+    return initial
 
 
 def elf_memory_map(folder):
@@ -1643,6 +2290,46 @@ def gem5_statistics(path: Path):
         except ValueError:
             continue
     return statistics
+
+
+def branch_predictor_report(result_dir, configuration, teaching_cycles=None):
+    """Summarize the real predictor outcome independently of table timing."""
+    if configuration.get("cpu") != "out-of-order":
+        return ""
+    names = {
+        "ideal": "Ideal (perfect prediction)",
+        "local": "Local two-bit", "tournament": "Tournament",
+        "bimode": "Bi-mode", "tage": "TAGE",
+    }
+    if configuration.get("branchPredictor") == "ideal":
+        return "\n".join([
+            "Branch prediction:",
+            "  Predictor: Ideal (perfect prediction)",
+        ])
+    statistics = gem5_statistics(result_dir / "stats.txt")
+    predictions = int(statistics.get("system.cpu.branchPred.condPredicted", 0))
+    incorrect = int(statistics.get("system.cpu.branchPred.condIncorrect", 0))
+    correct = max(0, predictions - incorrect)
+    accuracy = (100 * correct / predictions) if predictions else 0
+    gem5_cycles = int(statistics.get("system.cpu.numCycles", 0))
+    committed = int(statistics.get("system.cpu.committedInsts", 0))
+    gem5_cpi = (gem5_cycles / committed) if committed else 0
+    lines = [
+        "Branch prediction:",
+        f"  Predictor: {names.get(configuration.get('branchPredictor'), 'Local two-bit')}",
+        f"  Conditional predictions: {predictions}",
+        f"  Correct: {correct} · Incorrect: {incorrect} · Accuracy: {accuracy:.1f}%",
+    ]
+    if gem5_cycles:
+        lines.append(
+            f"  Detailed gem5 completion: {gem5_cycles} cycles · CPI {gem5_cpi:.3f}")
+    lines.append(
+        "  The teaching pipeline uses gem5's real prediction outcomes. "
+        "BP miss labels, X rows, and recovery cycles show their timing effect.")
+    lines.append(
+        "  The statistics may also count predictions made on speculative "
+        "paths that an older misprediction later squashed.")
+    return "\n".join(lines)
 
 
 def cache_size_bytes(value):
@@ -2005,7 +2692,8 @@ def normalize_non_cache_timeline(data, configuration):
     Cache mode remains untouched because those cycles represent real hits and
     misses from gem5's cache hierarchy.
     """
-    if configuration["memoryMode"] == "cache" or not data["instructions"]:
+    if (configuration["memoryMode"] == "cache" or not data["instructions"]
+            or data.get("lectureTimingApplied")):
         return
 
     useful_cycle = {}
@@ -2639,6 +3327,8 @@ def schedule_direct_in_order_pipeline(data, configuration):
     previous = None
     previous_issue = -10**12
     forwarding = bool(configuration.get("forwarding"))
+    out_of_order_execution = bool(
+        configuration.get("outOfOrderExecution", True))
 
     def forwarded_ready(producer):
         # A load produces its value at the end of M; other functional units
@@ -2675,6 +3365,10 @@ def schedule_direct_in_order_pipeline(data, configuration):
 
         execute = max(decode + 1, previous_issue + 1,
                       unit_ready[info["unit"]])
+        if previous is not None and not out_of_order_execution:
+            # With dynamic execution disabled, a younger instruction cannot
+            # begin until the older instruction has left its functional unit.
+            execute = max(execute, previous["EEnd"] + 1)
         # With forwarding, normal ALU/address operands may wait after Decode
         # until the producer can supply them.  Store data is intentionally not
         # included: it is consumed by the store only when that row reaches M.
@@ -2692,6 +3386,10 @@ def schedule_direct_in_order_pipeline(data, configuration):
                 store_data_ready = (producer["W"] + 1 if not forwarding
                                     else forwarded_ready(producer))
                 memory = max(memory, store_data_ready)
+        if previous is not None and not out_of_order_execution:
+            # Preserve program order at the shared memory-stage boundary too;
+            # this prevents a short younger operation from passing a long one.
+            memory = max(memory, previous["M"] + 1)
         if info["load"]:
             memory_latency = configuration["dataReadLatency"]
         elif info["store"]:
@@ -2706,6 +3404,8 @@ def schedule_direct_in_order_pipeline(data, configuration):
             memory += 1
         memory_end = memory + memory_latency - 1
         writeback = memory_end + 1
+        if previous is not None and not out_of_order_execution:
+            writeback = max(writeback, previous["W"] + 1)
         memory_stage_busy.update(range(memory, memory_end + 1))
 
         record = {
@@ -2806,26 +3506,27 @@ def schedule_direct_in_order_pipeline(data, configuration):
         cycle: values for cycle, values in relocated_registers.items() if values
     }
 
-    relocated_memory = {cycle: values.copy()
-                        for cycle, values in original_memory.items()}
-    memory_moves = []
+    # Exec memory events occur when gem5 completes an access, which need not
+    # equal the first raw MinorGUI M event. Associate them by dynamic PC and
+    # program order, then place each access at the rescheduled M completion.
+    # This also prevents late events from being trimmed as if they belonged
+    # beyond the visible teaching pipeline.
+    memory_events = defaultdict(deque)
+    for _cycle, changes in sorted(original_memory.items(),
+                                  key=lambda item: int(item[0])):
+        for address, event in changes.items():
+            memory_events[event.get("pc", "").lower()].append((address, event))
+    relocated_memory = defaultdict(dict)
     for row in executed:
-        old_cycle = original_timing[id(row)]["M"]
-        new_cycle = scheduled[id(row)]["M"]
-        if old_cycle is None or old_cycle == new_cycle:
+        timing = scheduled[id(row)]
+        if not (timing["load"] or timing["store"]):
             continue
-        pc = "0x" + row["address"]
-        for address, event in original_memory.get(str(old_cycle), {}).items():
-            if event.get("pc") == pc:
-                memory_moves.append((str(old_cycle), str(new_cycle),
-                                     address, event))
-    for old_cycle, _new_cycle, address, _event in memory_moves:
-        relocated_memory.get(old_cycle, {}).pop(address, None)
-    for _old_cycle, new_cycle, address, event in memory_moves:
-        relocated_memory.setdefault(new_cycle, {})[address] = event
-    data["memoryDeltas"] = {
-        cycle: values for cycle, values in relocated_memory.items() if values
-    }
+        events = memory_events["0x" + row["address"].lower()]
+        if not events:
+            continue
+        address, event = events.popleft()
+        relocated_memory[str(timing["MEnd"])][address] = event
+    data["memoryDeltas"] = dict(relocated_memory)
     return True
 
 
@@ -2918,6 +3619,130 @@ def fill_in_order_stall_gaps(data, configuration):
     data["instructions"] = compact_iterations(dynamic)
 
 
+def enforce_five_stage_in_order_completion(data, configuration):
+    """Prevent younger cache-mode instructions from passing older work.
+
+    Direct memory is scheduled explicitly above. Cache traces retain gem5's
+    measured F/M service durations, so this pass moves only E/M/W boundaries
+    when dynamic execution is disabled. The cache hit/miss latency itself is
+    preserved.
+    """
+    if (configuration["cpu"] != "in-order"
+            or configuration.get("outOfOrderExecution", True)
+            or configuration["memoryMode"] != "cache"):
+        return
+
+    def stage_cycles(row, marker):
+        return sorted(int(cycle) for cycle, value in row.get("cycles", {}).items()
+                      if marker in value)
+
+    rows = sorted(
+        (row for row in data.get("dynamicInstructions", [])
+         if not row.get("squashed") and stage_cycles(row, "E")),
+        key=lambda row: min(
+            stage_cycles(row, "F") or stage_cycles(row, "D"),
+            default=10**12),
+    )
+    if not rows:
+        return
+
+    original_registers = data.get("registerDeltas", {})
+    original_memory = data.get("memoryDeltas", {})
+    moved_registers = {cycle: values.copy()
+                       for cycle, values in original_registers.items()}
+    moved_memory = {cycle: values.copy()
+                    for cycle, values in original_memory.items()}
+    timing = {}
+    previous = None
+
+    for row in rows:
+        execute_cells = stage_cycles(row, "E")
+        memory_cells = stage_cycles(row, "M")
+        writeback_cells = stage_cycles(row, "W")
+        execute_duration = max(1, len(execute_cells))
+        memory_duration = max(1, len(memory_cells))
+        execute = execute_cells[0]
+        if previous is not None:
+            execute = max(execute, previous["EEnd"] + 1)
+        execute_end = execute + execute_duration - 1
+        memory = max(memory_cells[0] if memory_cells else execute_end + 1,
+                     execute_end + 1)
+        if previous is not None:
+            memory = max(memory, previous["MEnd"] + 1)
+        memory_end = memory + memory_duration - 1
+        writeback = max(writeback_cells[0] if writeback_cells else memory_end + 1,
+                        memory_end + 1)
+        if previous is not None:
+            writeback = max(writeback, previous["W"] + 1)
+
+        first = min(int(cycle) for cycle in row["cycles"])
+        prefix = {
+            cycle: value for cycle, value in row["cycles"].items()
+            if int(cycle) < execute_cells[0]
+        }
+        cycles = {str(cycle): "S" for cycle in range(first, writeback + 1)}
+        cycles.update(prefix)
+        for cycle in range(execute, execute_end + 1):
+            cycles[str(cycle)] = "E"
+        for cycle in range(memory, memory_end + 1):
+            cycles[str(cycle)] = "M"
+        cycles[str(writeback)] = "W"
+        row["cycles"] = cycles
+
+        old_writeback = writeback_cells[0] if writeback_cells else None
+        destination = destination_register(row.get("instruction", ""))
+        if (destination and destination != "x0" and old_writeback is not None
+                and old_writeback != writeback):
+            value = moved_registers.get(str(old_writeback), {}).pop(
+                destination, None)
+            if value is not None:
+                moved_registers.setdefault(str(writeback), {})[destination] = value
+
+        pc = "0x" + row.get("address", "")
+        memory_event = None
+        memory_event_cycle = None
+        for old_cycle in memory_cells:
+            for address, event in list(moved_memory.get(str(old_cycle), {}).items()):
+                if event.get("pc") == pc:
+                    memory_event = (address, event)
+                    memory_event_cycle = old_cycle
+                    break
+            if memory_event:
+                break
+        if memory_event and memory_event_cycle != memory:
+            address, event = memory_event
+            moved_memory[str(memory_event_cycle)].pop(address, None)
+            moved_memory.setdefault(str(memory), {})[address] = event
+
+        timing[id(row)] = {
+            "oldE": execute_cells[0], "E": execute, "EEnd": execute_end,
+            "M": memory, "MEnd": memory_end, "W": writeback,
+        }
+        previous = timing[id(row)]
+
+    branch_rows = defaultdict(deque)
+    for row in rows:
+        opcode = display_instruction(row.get("instruction", "")).split(None, 1)[0]
+        if re.fullmatch(r"(?:b(?:eq|ne|lt|ge|ltu|geu)|j|jr|jal|jalr|ret)", opcode):
+            branch_rows[row.get("address")].append(row)
+    for jump in sorted(data.get("jumps", []), key=lambda item: item["cycle"]):
+        candidates = branch_rows[jump.get("fromAddress")]
+        if candidates:
+            row = min(candidates,
+                      key=lambda candidate: abs(
+                          timing[id(candidate)]["oldE"] - jump["cycle"]))
+            candidates.remove(row)
+            jump["cycle"] = timing[id(row)]["E"]
+
+    data["registerDeltas"] = {
+        cycle: values for cycle, values in moved_registers.items() if values
+    }
+    data["memoryDeltas"] = {
+        cycle: values for cycle, values in moved_memory.items() if values
+    }
+    data["instructions"] = compact_iterations(data["dynamicInstructions"])
+
+
 def pipeline(name):
     folder = project_dir(name)
     source = clean_source(source_file(folder).read_text())
@@ -2938,6 +3763,7 @@ def pipeline(name):
     dump = folder / f"{artifact_stem(folder)}.dump"
     end_address = None
     start_address = None
+    dump_text = ""
     if dump.exists():
         dump_text = dump.read_text(errors="replace")
         match = re.search(r"^\s*([0-9a-fA-F]+)\s+<End>:\s*$",
@@ -2948,6 +3774,16 @@ def pipeline(name):
                           dump_text, re.M | re.I)
         if match:
             start_address = int(match.group(1), 16)
+    evaluation_start_address = None
+    evaluation_start_label = configuration.get("o3EvaluationLabel", "")
+    if configured_cpu == "out-of-order" and evaluation_start_label:
+        label_match = re.search(
+            rf"^\s*([0-9a-fA-F]+)\s+<{re.escape(evaluation_start_label)}>:\s*$",
+            dump_text, re.M,
+        )
+        if not label_match:
+            fail(f"Evaluation start label '{evaluation_start_label}' was not found in the compiled program.")
+        evaluation_start_address = int(label_match.group(1), 16)
     if end_address is None:
         # If End immediately follows _start (an empty project), both labels
         # have the same address and objdump prints only <_start>. Source-line
@@ -2972,12 +3808,15 @@ def pipeline(name):
             cycle: address for cycle, address in data.get("pcDeltas", {}).items()
             if int(address, 16) < end_address
         }
+    schedule_lecture_o3_pipeline(data, configuration, evaluation_start_address)
     normalize_non_cache_timeline(data, configuration)
     if not schedule_direct_in_order_pipeline(data, configuration):
         normalize_direct_in_order_control(data, configuration)
         normalize_forwarded_dependencies(data, configuration)
     normalize_in_order_taken_branches(data, configuration)
     fill_in_order_stall_gaps(data, configuration)
+    enforce_five_stage_in_order_completion(data, configuration)
+    configure_o3_stage_display(data, configuration)
     visible_cycles = [int(cycle) for row in data["instructions"]
                       for cycle in row["cycles"]]
     data["cycles"] = max(visible_cycles, default=0)
@@ -2997,8 +3836,11 @@ def pipeline(name):
                      if int(cycle) <= data["cycles"]}
     data["configuration"] = configuration
     data["dataSymbols"] = data_symbols(folder)
+    data["initialMemory"] = elf_initial_memory(folder, data["dataSymbols"])
     data["memoryMap"] = elf_memory_map(folder)
     add_cache_analysis(data, configuration, result_dir, data["dataSymbols"])
+    data["branchReport"] = branch_predictor_report(
+        result_dir, configuration, data["cycles"])
     return data
 
 
@@ -3099,7 +3941,9 @@ def pipeline_for_display(name):
         "limit": display_limit,
         "csvPath": str(destination),
         "cacheReport": data.get("cacheReport", ""),
+        "branchReport": data.get("branchReport", ""),
         "dataSymbols": data.get("dataSymbols", []),
+        "initialMemory": data.get("initialMemory", {}),
         "memoryMap": data.get("memoryMap", []),
         **pipeline_statistics(data),
     }
@@ -3196,6 +4040,78 @@ def git_run(args, timeout=20, cwd=ROOT):
     return result.returncode == 0, output
 
 
+def required_repository_branches():
+    """Load the deployment branches required for a supported Studio run."""
+    try:
+        values = json.loads(REQUIRED_BRANCHES_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        fail(f"Required-branch configuration is missing: {REQUIRED_BRANCHES_FILE}", 500)
+    except (OSError, json.JSONDecodeError) as error:
+        fail(f"Required-branch configuration cannot be read: {error}", 500)
+    if not isinstance(values, dict):
+        fail("Required-branch configuration must be a JSON object.", 500)
+    branches = {}
+    for key in ("simulator", "gem5"):
+        branch = values.get(key)
+        if (not isinstance(branch, str) or not branch.strip()
+                or branch.startswith("-") or "\0" in branch
+                or any(character.isspace() for character in branch)):
+            fail(f"Required branch '{key}' is invalid.", 500)
+        branches[key] = branch.strip()
+    return branches
+
+
+def repository_current_branch(repository):
+    ok, branch = git_run(["branch", "--show-current"], cwd=repository)
+    if not ok:
+        return None
+    return branch.strip() or "(detached HEAD)"
+
+
+def require_startup_repositories():
+    """Block startup when simulator/gem5 are not on deployment branches."""
+    required = required_repository_branches()
+    problems = []
+    parent_branch = repository_current_branch(ROOT)
+    if parent_branch is None:
+        problems.append(f"Simulator is not a Git checkout: {ROOT}")
+    elif parent_branch != required["simulator"]:
+        problems.append(
+            f"Simulator requires branch '{required['simulator']}', "
+            f"but '{parent_branch}' is checked out.")
+
+    values = setup_environment()
+    values.update(environment_overrides())
+    try:
+        build_dir = resolve_environment_path(values["GEM5_INSTALLATION_PATH"])
+    except (KeyError, ValueError) as error:
+        problems.append(f"The configured gem5 path is invalid: {error}")
+    else:
+        ok, top = git_run(["rev-parse", "--show-toplevel"], cwd=build_dir)
+        if not ok:
+            problems.append(
+                f"The configured gem5 build is not inside a Git checkout: {build_dir}")
+        else:
+            gem5_root = Path(top).resolve()
+            gem5_branch = repository_current_branch(gem5_root)
+            if gem5_branch is None:
+                problems.append(f"gem5 is not a Git checkout: {gem5_root}")
+            elif gem5_branch != required["gem5"]:
+                problems.append(
+                    f"gem5 requires branch '{required['gem5']}', "
+                    f"but '{gem5_branch}' is checked out.")
+    if problems:
+        detail = "\n".join(f"- {problem}" for problem in problems)
+        fail(
+            "ASE Studio cannot start because its repositories do not match "
+            "the supported deployment.\n"
+            f"{detail}\n"
+            f"Change required branch names in {REQUIRED_BRANCHES_FILE}.",
+            500,
+        )
+    return required
+
+
 def normalized_git_remote(value):
     """Normalize common HTTPS/SSH GitHub URLs for identity checks."""
     remote = value.strip().removesuffix(".git").removesuffix("/")
@@ -3211,8 +4127,7 @@ def configured_gem5_checkout(values=None):
         values.update(environment_overrides())
     try:
         build_dir = resolve_environment_path(values["GEM5_INSTALLATION_PATH"])
-        executable = (build_dir / values["GEM5_ISA"]
-                      / f"gem5.{values['GEM5_VARIANT']}")
+        executable = build_dir / GEM5_ISA / f"gem5.{GEM5_VARIANT}"
     except (KeyError, ValueError) as error:
         return {"managed": False,
                 "message": f"gem5 update checking is unavailable: {error}"}
@@ -3537,8 +4452,12 @@ class Handler(SimpleHTTPRequestHandler):
                                        "protectedLines": protected_lines(source)})
             if url.path == "/api/symbols":
                 folder = project_dir(parse_qs(url.query).get("name", [""])[0])
-                return self.send_json({"symbols": data_symbols(folder),
-                                       "memoryMap": elf_memory_map(folder)})
+                symbols = data_symbols(folder)
+                return self.send_json({
+                    "symbols": symbols,
+                    "initialMemory": elf_initial_memory(folder, symbols),
+                    "memoryMap": elf_memory_map(folder),
+                })
             if url.path == "/api/pipeline":
                 return self.send_json(pipeline_for_display(
                     parse_qs(url.query).get("name", [""])[0]))
@@ -3644,6 +4563,15 @@ TEMPLATE = "# Add an optional .data section here.\n\n# The text section contains
 MAKEFILE = "ASM = ./main.s\ninclude ../demo.mk\n"
 
 if __name__ == "__main__":
+    try:
+        require_startup_repositories()
+    except ValueError as error:
+        message, _status = error.args[0]
+        print(message, file=sys.stderr)
+        raise SystemExit(1)
+    if "--check-startup" in sys.argv:
+        print("ASE Studio repository branches are valid.")
+        raise SystemExit(0)
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
     try:
         server = ThreadingHTTPServer(("127.0.0.1", port), Handler)

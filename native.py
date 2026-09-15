@@ -23,7 +23,7 @@ ICON_PATH = STUDIO_ROOT / "frontend" / "icon.png"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from ase_studio.backend import Handler  # noqa: E402
+from ase_studio.backend import Handler, require_startup_repositories  # noqa: E402
 from http.server import ThreadingHTTPServer  # noqa: E402
 
 
@@ -35,11 +35,27 @@ def create_server(preferred_port: int) -> ThreadingHTTPServer:
 
 
 def main() -> int:
-    preferred_port = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
     GLib.set_prgname(WM_CLASS)
     GLib.set_application_name("ASE Studio")
     if ICON_PATH.exists():
         Gtk.Window.set_default_icon_from_file(str(ICON_PATH))
+    try:
+        require_startup_repositories()
+    except ValueError as error:
+        message, _status = error.args[0]
+        print(message, file=sys.stderr)
+        dialog = Gtk.MessageDialog(
+            modal=True,
+            message_type=Gtk.MessageType.ERROR,
+            buttons=Gtk.ButtonsType.CLOSE,
+            text="Unsupported repository branches",
+        )
+        dialog.set_title("ASE Studio startup")
+        dialog.format_secondary_text(message)
+        dialog.run()
+        dialog.destroy()
+        return 1
+    preferred_port = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
 
     application = Gtk.Application(application_id=APPLICATION_ID)
     server = None

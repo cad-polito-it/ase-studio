@@ -30,6 +30,7 @@ let messageDialogTrimInput = true;
 let pipelineSelectTarget = null;
 let externalSyncBusy = false;
 let memoryWatches = [];
+let cpuConfigurationOpenedAs = null;
 
 function closeActionDialog(value) {
   const dialog = $("#message-dialog");
@@ -356,6 +357,7 @@ async function openProject(name, {skipUnsavedCheck = false} = {}) {
     api("/api/symbols?name=" + encodedName).catch(() => ({symbols: []}))
   ]);
   opened.dataSymbols = symbolData.symbols || [];
+  opened.initialMemory = symbolData.initialMemory || {};
   opened.memoryMap = symbolData.memoryMap || [];
   current = opened;
   loadMemoryWatches();
@@ -576,8 +578,9 @@ async function submitAssignment() {
     updateLog();
     if (result.ok) {
       const trace = await api("/api/pipeline?name=" + encodeURIComponent(current.name));
-      appendCacheReport(trace);
+      appendSimulationReports(trace);
       current.dataSymbols = trace.dataSymbols || [];
+      current.initialMemory = trace.initialMemory || {};
       current.memoryMap = trace.memoryMap || [];
       if (trace.tooLarge) {
         pipelineData = null;
@@ -668,8 +671,9 @@ async function run(stepAfterRun = false) {
     updateLog();
     if (result.ok) {
       const trace = await api("/api/pipeline?name=" + encodeURIComponent(current.name));
-      appendCacheReport(trace);
+      appendSimulationReports(trace);
       current.dataSymbols = trace.dataSymbols || [];
+      current.initialMemory = trace.initialMemory || {};
       current.memoryMap = trace.memoryMap || [];
       if (trace.tooLarge) {
         pipelineData = null;
@@ -781,7 +785,7 @@ function renderRegisters() {
   }
   const deltas = pipelineData.registerDeltas || {};
   const pcDeltas = pipelineData.pcDeltas || {};
-  const state = {};
+  const state = {...(pipelineData.initialRegisters || {})};
   const changed = new Set();
   let pc = "—";
   let pcChanged = false;
@@ -843,8 +847,16 @@ function renderPipelineDiagram() {
   if (!pipelineData) return;
   const config = pipelineData.configuration || {};
   const o3 = config.cpu === "out-of-order";
+  const visibleO3Stages = new Set(config.o3VisibleStages || ["issue", "execute", "memory", "cdb", "commit"]);
+  const o3Stages = [
+    ["fetch", "Fetch", "F"], ["decode", "Decode", "D"],
+    ["rename", "Rename", "R"], ["issue", "Issue", "I"],
+    ["execute", "EXE", "E"], ["memory", "MEM", "M"],
+    ["cdb", `CDB × ${config.writebackWidth || 1}`, "C"],
+    ["commit", "Commit", "W"]
+  ];
   const stages = o3
-    ? [["Fetch", "F"], ["Decode", "D"], ["Rename", "R"], ["Dispatch / Issue", "I"], ["Execute", "E"], ["Complete", "C"], ["Commit", "W"]]
+    ? o3Stages.filter(([key]) => visibleO3Stages.has(key)).map(([_key, label, code]) => [label, code])
     : [["Fetch", "F"], ["Decode", "D"], ["Execute", "E"], ["Memory", "M"], ["Writeback", "W"]];
   const blocks = stages.map(([stage, code], index) => `${index ? '<div class="diagram-arrow">↓</div>' : ""}<div class="diagram-stage stage-${code}">${stage}</div>`).join("");
   const memoryMode = config.memoryMode === "cache" ? "cache" : "direct";
@@ -852,12 +864,12 @@ function renderPipelineDiagram() {
     ? `L1 I ${config.iCacheSize} · D ${config.dCacheSize}<br>Hit ${config.cacheLatency} cycles · RAM ${config.memoryLatency} cycles`
     : `Direct memory · I ${config.instructionMemoryLatency} · Read ${config.dataReadLatency} · Write ${config.dataWriteLatency} cycles`;
   const details = (o3
-    ? `Fetch ${config.fetchWidth} · Decode ${config.decodeWidth}<br>Rename ${config.renameWidth} · Dispatch ${config.dispatchWidth}<br>Issue ${config.issueWidth} · WB ${config.writebackWidth}<br>Commit ${config.commitWidth}<br>ROB ${config.robEntries} · IQ ${config.iqEntries}<br>LQ ${config.lqEntries} · SQ ${config.sqEntries}`
-    : `Forwarding: ${config.forwarding ? "on" : "off"}`)
+    ? `${config.speculativeExecution ? "speculation on" : "speculation off"} · ${config.outOfOrderExecution !== false ? "out-of-order execution" : "in-order execution"}<br>Predictor: ${{ideal: "Ideal (perfect prediction)", local: "Local two-bit", tournament: "Tournament", bimode: "Bi-mode", tage: "TAGE"}[config.branchPredictor] || "Local two-bit"}<br>In-order issue ${config.dispatchWidth} · EXE issue ${config.issueWidth}<br>CDB ${config.writebackWidth} · Commit ${config.commitWidth}<br>ROB ${config.robEntries} · RS/IQ ${config.iqEntries}<br>LQ ${config.lqEntries} · SQ ${config.sqEntries}`
+    : `Forwarding: ${config.forwarding ? "on" : "off"}<br>Out-of-order execution: ${config.outOfOrderExecution !== false ? "on" : "off"}`)
     + `<br>Floating point: ${config.floatingPointPrecision === "double" ? "double (64-bit)" : "single (32-bit)"}`
     + `<br>Compressed instructions: ${config.compressedInstructions ? "on" : "off"}`
     + `<br>${memoryDetails}`;
-  $("#pipeline-diagram").innerHTML = `<div class="diagram-title">${o3 ? "Out-of-order" : "In-order"} stages</div>${blocks}<div class="diagram-detail">${details}</div>`;
+  $("#pipeline-diagram").innerHTML = `<div class="diagram-title">${o3 ? "Multiple-issue processor with speculation" : "Five-stage pipeline (in-order fetch and issue)"}</div>${blocks}<div class="diagram-detail">${details}</div>`;
 }
 
 function memoryWatchStorageKey(projectName = current?.name) {
@@ -970,7 +982,7 @@ function renderMemory() {
     return;
   }
 
-  const state = {};
+  const state = {...(pipelineData.initialMemory || current?.initialMemory || {})};
   const changed = new Set();
   const deltas = pipelineData.memoryDeltas || {};
   for (let cycle = 1; cycle <= playbackCycle; cycle++) {
@@ -1074,10 +1086,11 @@ function cacheEventsForPipelineRow(row, lastVisibleCycle) {
   return [...grouped.values()];
 }
 
-function appendCacheReport(trace) {
-  if (!trace?.cacheReport) return;
-  lastNormalLog += `\n\n${trace.cacheReport}`;
-  lastAdvancedLog += `\n\n${trace.cacheReport}`;
+function appendSimulationReports(trace) {
+  const reports = [trace?.cacheReport, trace?.branchReport].filter(Boolean);
+  if (!reports.length) return;
+  lastNormalLog += `\n\n${reports.join("\n\n")}`;
+  lastAdvancedLog += `\n\n${reports.join("\n\n")}`;
   updateLog();
 }
 
@@ -1111,7 +1124,7 @@ function renderPipeline() {
   const rowHeight = 27;
   const addressWidth = 88;
   const instructionWidth = window.innerWidth <= 700 ? 150 : 182;
-  const flowWidth = 112;
+  const flowWidth = window.innerWidth <= 700 ? 132 : 160;
   const columns = `${addressWidth}px ${instructionWidth}px ${flowWidth}px repeat(${data.cycles}, ${cellWidth}px)`;
   const totalWidth = addressWidth + instructionWidth + flowWidth + data.cycles * cellWidth;
   const grid = $("#pipeline-grid");
@@ -1126,14 +1139,19 @@ function renderPipeline() {
   const visibleCycle = playbackCycle === null ? data.cycles : playbackCycle;
   const cpi = dynamicRows.length ? (data.cycles / dynamicRows.length).toFixed(2) : "—";
   const codeBytes = data.codeBytes ?? new Set(data.instructions.map(row => row.address)).size * 4;
-  $("#pipeline-summary").textContent = `${displayRows.length} instructions · ${codeBytes} bytes pipeline code · CPI ${cpi}`;
+  const instructionCount = displayRows.filter(row =>
+    !row.squashed && row.iterations !== 0).length;
+  const predictionMisses = displayRows.reduce((total, row) =>
+    total + Number(row.mispredictions || (row.mispredicted ? 1 : 0)), 0);
+  const predictionSummary = predictionMisses ? ` · ${predictionMisses} BP misses` : "";
+  $("#pipeline-summary").textContent = `${instructionCount} instructions · ${codeBytes} bytes pipeline code${predictionSummary} · CPI ${cpi}`;
   updateCycleNavigation();
   grid.style.width = totalWidth + "px";
 
   let header = `<div class="pipeline-header" style="grid-template-columns:${columns};width:${totalWidth}px">`;
   header += '<div class="cell address-cell head corner">PC Address</div>';
   header += '<div class="cell inst head corner">Instruction</div>';
-  header += '<div class="cell flow-cell head corner" title="Control-flow transfers and cache misses">Control / cache</div>';
+  header += '<div class="cell flow-cell head corner" title="Control-flow transfers, prediction misses, and cache misses">Control / cache</div>';
   for (let cycle = 1; cycle <= data.cycles; cycle++) {
     header += `<div class="cell head ${selectedColumn === cycle ? "column-selected" : ""}${cycle > visibleCycle ? " future" : ""}" data-col="${cycle}">${cycle}</div>`;
   }
@@ -1170,7 +1188,11 @@ function renderPipeline() {
         const status = `${event.cache}$ ${event.result}`;
         return `<span class="cache-event cache-${event.result}" title="${escapeHtml(`${status}; see Log Output for address and timing details`)}">${status}${count}</span>`;
       }).join("");
-      html += `<div class="cell flow-cell" data-row="${rowIndex}">${jumpLinks}${cacheEvents}</div>`;
+      const predictionMisses = Number(row.mispredictions || (row.mispredicted ? 1 : 0));
+      const predictionEvent = predictionMisses
+        ? `<span class="branch-miss">BP miss${predictionMisses > 1 ? ` ×${predictionMisses}` : ""}</span>`
+        : "";
+      html += `<div class="cell flow-cell" data-row="${rowIndex}">${jumpLinks}${predictionEvent}${cacheEvents}</div>`;
       for (let cycle = 1; cycle <= data.cycles; cycle++) {
         const stage = row.cycles[cycle] || "";
         const label = stage.length > 1 && stage !== "S" ? stage.split("").join("/") : stage;
@@ -1192,12 +1214,17 @@ function renderPipeline() {
       const stageNames = {
         F: "Fetch",
         D: "Decode",
+        R: "Rename",
+        I: "In-order issue to reservation station / IQ",
         E: "Execute",
         M: "Memory access / request",
-        W: "Writeback",
-        S: "Pipeline stall / wait"
+        C: "Write result on CDB",
+        W: pipelineData.format === "o3" ? "Commit" : "Writeback",
+        S: pipelineData.format === "o3" ? "Wait in reservation station / ROB" : "Pipeline stall / wait",
+        X: "Squashed after incorrect speculation"
       };
-      const stageName = stageNames[stage] || stage;
+      const stageName = stage.split("")
+        .map(marker => stageNames[marker] || marker).join(" / ");
       $("#detail").textContent = `Instruction: ${row.instruction} | Cycle: ${cell.dataset.col} | Stage: ${stageName} | Iterations: ${row.iterations}`;
     } else {
       $("#detail").textContent = `Clock cycle ${cell.dataset.col}`;
@@ -1261,6 +1288,8 @@ function exportVisiblePipeline() {
   const stalls = dynamicRows.reduce((total, row) =>
     total + Object.values(row.cycles).filter(stage => stage === "S").length, 0);
   const instructionCount = dynamicRows.length;
+  const predictionMisses = displayedPipelineRows().reduce((total, row) =>
+    total + Number(row.mispredictions || (row.mispredicted ? 1 : 0)), 0);
   const cpi = instructionCount ? (pipelineData.cycles / instructionCount).toFixed(3) : "0";
   const headers = ["PC Address", "Instruction", "Control flow / cache"];
   for (let cycle = 1; cycle <= lastCycle; cycle++) headers.push(`Cycle ${cycle}`);
@@ -1269,9 +1298,12 @@ function exportVisiblePipeline() {
       ...jumpsForPipelineRow(row, lastCycle).map(jump =>
         `0x${row.address} -> 0x${jump.target}${jump.cycles.length > 1 ? ` x${jump.cycles.length}` : ""}`),
       ...cacheEventsForPipelineRow(row, lastCycle).map(event =>
-        `${event.cache}$ ${event.result}${event.count > 1 ? ` x${event.count}` : ""}`)
+        `${event.cache}$ ${event.result}${event.count > 1 ? ` x${event.count}` : ""}`),
+      ...(Number(row.mispredictions || (row.mispredicted ? 1 : 0))
+        ? [`BP miss${Number(row.mispredictions || 1) > 1 ? ` x${Number(row.mispredictions)}` : ""}`]
+        : [])
     ].join("; ");
-    const values = [`0x${row.address}`, row.instruction, flow];
+    const values = [row.address ? `0x${row.address}` : "", row.instruction, flow];
     for (let cycle = 1; cycle <= lastCycle; cycle++) values.push(row.cycles[String(cycle)] || "");
     return values;
   });
@@ -1280,6 +1312,7 @@ function exportVisiblePipeline() {
     ["Total cycles", pipelineData.cycles],
     ["Executed instructions", instructionCount],
     ["Pipeline code size (bytes)", pipelineData.codeBytes || 0],
+    ["Branch prediction misses", predictionMisses],
     ["Stalls", stalls],
     ["CPI", cpi],
     []
@@ -1298,7 +1331,7 @@ function updateForwardingControl() {
   const outOfOrder = $("#cpu-model").value === "out-of-order";
   $("#forwarding").disabled = outOfOrder;
   if (outOfOrder) $("#forwarding").checked = true;
-  $("#forwarding-note").textContent = outOfOrder ? "(always enabled for O3CPU)" : "";
+  $("#forwarding-note").textContent = outOfOrder ? "(results use CDB/ROB forwarding)" : "";
   $("#o3-management").hidden = !outOfOrder;
 }
 
@@ -1318,6 +1351,7 @@ async function openCpuConfiguration() {
   if (!current) return;
   try {
     const config = await api("/api/config?name=" + encodeURIComponent(current.name));
+    cpuConfigurationOpenedAs = config.cpu;
     $("#cpu-model").value = config.cpu;
     $("#int-alu").value = config.intAlu;
     $("#int-mul").value = config.intMul;
@@ -1354,6 +1388,14 @@ async function openCpuConfiguration() {
     $("#iq-entries").value = config.iqEntries;
     $("#lq-entries").value = config.lqEntries;
     $("#sq-entries").value = config.sqEntries;
+    $("#branch-predictor").value = config.branchPredictor || "local";
+    $("#o3-evaluation-label").value = config.o3EvaluationLabel || "";
+    $("#out-of-order-execution").checked = config.outOfOrderExecution !== false;
+    $("#speculative-execution").checked = config.speculativeExecution !== false;
+    const visibleStages = new Set(config.o3VisibleStages || ["issue", "execute", "memory", "cdb", "commit"]);
+    document.querySelectorAll("[data-o3-stage]").forEach(input => {
+      input.checked = visibleStages.has(input.dataset.o3Stage);
+    });
     updateForwardingControl();
     updateMemoryControls();
     $("#cpu-dialog").showModal();
@@ -1366,8 +1408,6 @@ const environmentInputs = {
   RISCV_TOOLCHAIN_PATH: "#env-riscv-toolchain",
   OPTIMIZATION_FLAGS: "#env-optimization-flags",
   GEM5_INSTALLATION_PATH: "#env-gem5-installation",
-  GEM5_ISA: "#env-gem5-isa",
-  GEM5_VARIANT: "#env-gem5-variant",
   PIPELINE_DISPLAY_CYCLE_LIMIT: "#env-pipeline-cycle-limit",
   SUBMISSION_NAME_PREFIX: "#env-submission-prefix",
   SUBMISSION_NAME_SUFFIX: "#env-submission-suffix"
@@ -1733,7 +1773,20 @@ $("#expand-loops").onchange = () => {
   if (pipelineData) renderPipeline();
 };
 $("#advanced-logs").onchange = updateLog;
-$("#cpu-model").onchange = updateForwardingControl;
+$("#cpu-model").onchange = () => {
+  if (cpuConfigurationOpenedAs === "in-order"
+      && $("#cpu-model").value === "out-of-order") {
+    $("#issue-width").value = 2;
+    $("#writeback-width").value = 2;
+    $("#commit-width").value = 2;
+    const defaultStages = new Set(["issue", "execute", "memory", "cdb", "commit"]);
+    document.querySelectorAll("[data-o3-stage]").forEach(input => {
+      input.checked = defaultStages.has(input.dataset.o3Stage);
+    });
+    cpuConfigurationOpenedAs = "out-of-order";
+  }
+  updateForwardingControl();
+};
 $("#memory-mode").onchange = updateMemoryControls;
 $("#cancel-config").onclick = () => $("#cpu-dialog").close();
 $("#cancel-environment").onclick = () => $("#environment-dialog").close();
@@ -1798,7 +1851,13 @@ $("#cpu-form").onsubmit = async event => {
     robEntries: Number($("#rob-entries").value),
     iqEntries: Number($("#iq-entries").value),
     lqEntries: Number($("#lq-entries").value),
-    sqEntries: Number($("#sq-entries").value)
+    sqEntries: Number($("#sq-entries").value),
+    branchPredictor: $("#branch-predictor").value,
+    speculativeExecution: $("#speculative-execution").checked,
+    outOfOrderExecution: $("#out-of-order-execution").checked,
+    o3EvaluationLabel: $("#o3-evaluation-label").value.trim(),
+    o3VisibleStages: [...document.querySelectorAll("[data-o3-stage]:checked")]
+      .map(input => input.dataset.o3Stage)
   };
   try {
     await api("/api/config", {

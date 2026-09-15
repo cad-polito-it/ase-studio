@@ -27,7 +27,7 @@ ASE Studio is designed to live at `ase_studio/` as a Git submodule of the
 simulator repository. Clone the parent repository with its submodules:
 
 ```bash
-git clone --recurse-submodules https://github.com/cad-polito-it/ase_riscv_gem5_sim.git
+git clone --branch ase_studio --recurse-submodules https://github.com/cad-polito-it/ase_riscv_gem5_sim.git
 cd ase_riscv_gem5_sim
 ```
 
@@ -44,7 +44,7 @@ It can also install individual components or a complete frontend explicitly:
 ./utils/installation.sh toolchain
 ./utils/installation.sh gem5
 ./utils/installation.sh ase-studio
-./utils/installation.sh qt-visualizer
+./utils/installation.sh visualizer
 ./utils/installation.sh all-ase
 ./utils/installation.sh all-qt
 ```
@@ -52,6 +52,19 @@ It can also install individual components or a complete frontend explicitly:
 `all-ase` installs the RISC-V toolchain, gem5, and ASE Studio. `all-qt`
 installs the same simulator dependencies with the Qt visualizer. The
 installer updates the portable paths and selected frontend in `setup_default`.
+
+ASE Studio has no third-party pip dependencies; its backend uses the Python
+standard library. The native window requires Python 3, PyGObject, GTK 3, and
+WebKitGTK 4.1. Running the submodule installer directly installs and verifies
+these packages on Ubuntu/Debian, Fedora, or Arch/Manjaro:
+
+```bash
+./ase_studio/install.sh
+```
+
+The installer adds ASE Studio to the current user's application menu. When a
+desktop directory is available, it also creates a trusted `ASE Studio.desktop`
+shortcut there.
 
 ## License and educational use
 
