@@ -9,13 +9,15 @@
 
 
 ASE Studio is a free educational application for learning RISC-V assembly,
-processor hazards, memory behavior, and instruction pipelines. 
+processor hazards, memory behavior, and instruction pipelines.
 
 The simulation backend is based on the open-source gem5 architectural
 simulator. The five-stage RISC-V pipeline model builds on modifications
 developed by contributors to the
 [ase_riscv_gem5_sim](https://github.com/cad-polito-it/ase_riscv_gem5_sim)
 project.
+The modified simulator source is maintained in the CAD group's
+[gem5 repository](https://github.com/cad-polito-it/gem5).
 
 Contributions are welcome. Feel free to
 [open an issue](https://github.com/cad-polito-it/ase-studio/issues), submit a
