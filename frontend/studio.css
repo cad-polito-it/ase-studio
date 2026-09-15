@@ -190,13 +190,14 @@ h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: v
 .address-cell { position: sticky; left: 0; width: var(--address-width); text-align: left; padding: 5px 7px; background: #fff; color: #64748b; border-right: 1px solid #cbd5e1; z-index: 5; white-space: nowrap; overflow: hidden; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .inst { position: sticky; left: var(--address-width); width: var(--instruction-width); text-align: left; padding: 5px 8px; background: #fff; border-right: 1px solid #cbd5e1; z-index: 4; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .flow-cell { position: sticky; left: calc(var(--address-width) + var(--instruction-width)); width: var(--flow-width); padding: 2px 4px; background: #fff; border-right: 1px solid #cbd5e1; z-index: 3; overflow: hidden; white-space: nowrap; }
-.jump-arrow { width: 100%; border: 0; padding: 2px 3px; background: transparent; color: #b45309; text-align: left; font: 600 10px/1.4 ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; }
+.pipeline-row .flow-cell { display: flex; align-items: center; gap: 4px; }
+.jump-arrow { flex: 0 1 auto; min-width: 0; width: auto; border: 0; padding: 2px 3px; background: transparent; color: #b45309; text-align: left; font: 600 10px/1.4 ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .jump-arrow:hover { background: #fef3c7; }
-.jump-label { display: block; width: 100%; padding: 2px 3px; color: #b45309; text-align: left; font: 600 10px/1.4 ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; }
-.cache-event { display: inline-block; max-width: 100%; padding: 3px 2px; text-align: left; font: 700 9px/1.4 ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; vertical-align: top; }
+.jump-label { display: inline-block; flex: 0 1 auto; min-width: 0; width: auto; padding: 2px 3px; color: #b45309; text-align: left; font: 600 10px/1.4 ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cache-event { display: inline-block; flex: 0 0 auto; max-width: 100%; padding: 3px 2px; text-align: left; font: 700 9px/1.4 ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; vertical-align: top; }
 .cache-event + .cache-event { margin-left: 3px; }
 .cache-miss { color: #b91c1c; }
-.branch-miss { display: inline-block; padding: 3px 2px; color: #b91c1c; font: 700 9px/1.4 ui-monospace, monospace; }
+.branch-miss { display: inline-block; flex: 0 0 auto; padding: 3px 2px; color: #b91c1c; font: 700 9px/1.4 ui-monospace, monospace; }
 .cache-hit { color: #15803d; }
 .head { background: #eef4fb; z-index: 7; font-weight: 600; }
 .corner { z-index: 9; }

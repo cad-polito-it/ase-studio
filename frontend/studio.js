@@ -1124,7 +1124,7 @@ function renderPipeline() {
   const rowHeight = 27;
   const addressWidth = 88;
   const instructionWidth = window.innerWidth <= 700 ? 150 : 182;
-  const flowWidth = window.innerWidth <= 700 ? 132 : 160;
+  const flowWidth = window.innerWidth <= 700 ? 132 : 140;
   const columns = `${addressWidth}px ${instructionWidth}px ${flowWidth}px repeat(${data.cycles}, ${cellWidth}px)`;
   const totalWidth = addressWidth + instructionWidth + flowWidth + data.cycles * cellWidth;
   const grid = $("#pipeline-grid");

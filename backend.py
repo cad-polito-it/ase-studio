@@ -1476,6 +1476,16 @@ def schedule_lecture_o3_pipeline(data, configuration, start_address=None):
     if not committed:
         return False
 
+    # gem5 uses a real local predictor to generate the architectural stream
+    # for Ideal mode. Its raw miss annotations are implementation details of
+    # that trace generator and must not appear in the perfect-prediction
+    # teaching projection, summary, Control/cache column, or CSV export.
+    if configuration.get("branchPredictor") == "ideal":
+        for row in committed:
+            row.pop("mispredicted", None)
+            row.pop("mispredictTick", None)
+            row.pop("predictionPenalty", None)
+
     original_cycles = {
         id(row): sorted(int(cycle) for cycle in row.get("cycles", {}))
         for row in all_committed
