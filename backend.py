@@ -58,6 +58,7 @@ GEM5_ISA = "RISCV"
 GEM5_VARIANT = "opt"
 OFFICIAL_GEM5_REPOSITORY = "github.com/cad-polito-it/gem5"
 REQUIRED_BRANCHES_FILE = ROOT / "ase_studio_branches.json"
+LOCAL_SETUP_PATHSPEC = "setup_default*"
 SCAFFOLD_COMMENTS = {
     "# The text section contains the instructions that the CPU runs.",
     "# Make _start visible as the point where the program begins.",
@@ -791,9 +792,37 @@ def launch_component_installer(component):
 
 
 def run_command(command, cwd, env):
-    result = subprocess.run(command, cwd=cwd, env=env, text=True, capture_output=True)
-    output = "$ " + " ".join(command) + "\n" + result.stdout + result.stderr
+    # Keep diagnostics in their real order. Appending separately captured
+    # stderr after stdout made gem5's startup message appear after the final
+    # trace event, which looked like an accidental second simulation.
+    result = subprocess.run(
+        command, cwd=cwd, env=env, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    output = "$ " + " ".join(command) + "\n" + result.stdout
     return result.returncode, output
+
+
+def simulation_output_for_display(output, trace):
+    """Hide the verbose MinorGUI event block while retaining its trace file."""
+    lines = output.splitlines()
+    start = next((index for index, line in enumerate(lines)
+                  if line.strip() == "**** REAL SIMULATION ****"), None)
+    if start is None:
+        return output
+    end = next((index for index in range(len(lines) - 1, start, -1)
+                if "Log4GUI:" in lines[index]), None)
+    if end is None:
+        return output
+    try:
+        shown_path = trace.relative_to(ROOT)
+    except ValueError:
+        shown_path = trace
+    notice = (
+        f"[Detailed pipeline events omitted from this view. Full gem5 log: "
+        f"{shown_path}]"
+    )
+    return "\n".join([*lines[:start], notice, *lines[end + 1:]]).strip() + "\n"
 
 
 def build(name):
@@ -903,8 +932,12 @@ def simulate(name):
     rc, output = run_command(command, ROOT, env)
     if in_order:
         trace.write_text(output)
+        displayed_output = simulation_output_for_display(output, trace)
+    else:
+        displayed_output = output
     message = "Simulation completed.\n" if rc == 0 else "Simulation failed.\n"
-    return {"ok": rc == 0, "output": message, "advancedOutput": output + "\n" + message,
+    return {"ok": rc == 0, "output": message,
+            "advancedOutput": displayed_output + "\n" + message,
             "trace": trace.name}
 
 
@@ -4314,7 +4347,7 @@ def update_status(refresh=False):
             ROOT,
             "Simulator",
             refresh,
-            ignored_paths=("ase_studio",),
+            ignored_paths=("ase_studio", LOCAL_SETUP_PATHSPEC),
         ),
         repository_update_status(STUDIO_ROOT, "ASE Studio", refresh),
         gem5_update_status(refresh),
@@ -4343,6 +4376,63 @@ def discard_tracked_repository_changes(repository, pathspec=(".",)):
     if not restored:
         return False, output or "Git could not restore the tracked files."
     return True, output
+
+
+def preserve_local_setup_files():
+    """Temporarily reset tracked setup_default files while the parent pulls.
+
+    Excluding deployment-local setup files from the dirty check makes the
+    Update button available, but Git would still reject a pull that changes
+    the same files upstream. Save their exact working-tree contents, restore
+    the repository copies for the pull, and let the caller put the local
+    versions back afterwards.
+    """
+    listed, output = git_run(
+        ["diff", "--name-only", "HEAD", "--", LOCAL_SETUP_PATHSPEC],
+        cwd=ROOT,
+    )
+    if not listed:
+        return None, output or "Could not inspect local setup files."
+    snapshots = []
+    for relative_name in output.splitlines():
+        relative_path = Path(relative_name)
+        candidate = (ROOT / relative_name).resolve()
+        if (relative_path.parent != Path(".")
+                or not relative_path.name.startswith("setup_default")
+                or not candidate.is_relative_to(ROOT)):
+            return None, f"Refusing to preserve an unexpected setup path: {relative_name}"
+        exists = candidate.is_file()
+        snapshots.append({
+            "path": candidate,
+            "relative": relative_name,
+            "exists": exists,
+            "contents": candidate.read_bytes() if exists else None,
+            "mode": candidate.stat().st_mode if exists else None,
+        })
+    if snapshots:
+        restored, restore_output = git_run(
+            ["restore", "--source=HEAD", "--staged", "--worktree", "--",
+             LOCAL_SETUP_PATHSPEC],
+            cwd=ROOT,
+        )
+        if not restored:
+            return None, restore_output or "Could not prepare local setup files for update."
+    return snapshots, ""
+
+
+def restore_local_setup_files(snapshots):
+    """Restore setup_default working-tree contents saved before an update."""
+    try:
+        for snapshot in snapshots:
+            path = snapshot["path"]
+            if snapshot["exists"]:
+                path.write_bytes(snapshot["contents"])
+                path.chmod(snapshot["mode"] & 0o7777)
+            elif path.exists():
+                path.unlink()
+    except OSError as error:
+        return False, f"Could not restore local setup files after update: {error}"
+    return True, ""
 
 
 def pull_update(discard_local_changes=False):
@@ -4376,10 +4466,22 @@ def pull_update(discard_local_changes=False):
     ok = True
     parent = status["repositories"][0]
     if parent["available"]:
+        setup_snapshots, setup_error = preserve_local_setup_files()
+        if setup_snapshots is None:
+            message = "Could not preserve local setup files before update:\n" + setup_error
+            return {"ok": False, "output": message, "advancedOutput": message}
         command = (["pull", "--ff-only", "origin", parent["branch"]]
                    if parent["branch"] else
                    ["merge", "--ff-only", parent["remoteRef"]])
         pulled, output = git_run(command, timeout=90, cwd=ROOT)
+        setup_restored, setup_restore_error = restore_local_setup_files(setup_snapshots)
+        if not setup_restored:
+            pulled = False
+            output = ((output + "\n") if output else "") + setup_restore_error
+        elif setup_snapshots:
+            preserved = ", ".join(snapshot["relative"] for snapshot in setup_snapshots)
+            output = ((output + "\n") if output else "") + (
+                "Preserved local setup configuration: " + preserved)
         ok = ok and pulled
         if output:
             outputs.append(f"Simulator:\n{output}")
