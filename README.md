@@ -35,7 +35,7 @@ cd ase_riscv_gem5_sim
 
 The unified installer supports Ubuntu, Fedora, and Arch Linux. Run it without
 an argument for an interactive menu:
-
+ 
 ```bash
 ./utils/installation.sh
 ```
