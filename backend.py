@@ -59,6 +59,8 @@ GEM5_VARIANT = "opt"
 OFFICIAL_GEM5_REPOSITORY = "github.com/cad-polito-it/gem5"
 REQUIRED_BRANCHES_FILE = ROOT / "ase_studio_branches.json"
 LOCAL_SETUP_PATHSPEC = "setup_default*"
+LOCAL_PROGRAM_PATHSPEC = "programs/**"
+LOCAL_PARENT_PATHSPECS = (LOCAL_SETUP_PATHSPEC, LOCAL_PROGRAM_PATHSPEC)
 SCAFFOLD_COMMENTS = {
     "# The text section contains the instructions that the CPU runs.",
     "# Make _start visible as the point where the program begins.",
@@ -4347,7 +4349,9 @@ def update_status(refresh=False):
             ROOT,
             "Simulator",
             refresh,
-            ignored_paths=("ase_studio", LOCAL_SETUP_PATHSPEC),
+            # Source projects and setup_default variants are local student or
+            # deployment data. They must survive simulator updates.
+            ignored_paths=("ase_studio", *LOCAL_PARENT_PATHSPECS),
         ),
         repository_update_status(STUDIO_ROOT, "ASE Studio", refresh),
         gem5_update_status(refresh),
@@ -4378,14 +4382,13 @@ def discard_tracked_repository_changes(repository, pathspec=(".",)):
     return True, output
 
 
-def preserve_local_setup_files():
-    """Temporarily reset tracked setup_default files while the parent pulls.
+def preserve_local_parent_files():
+    """Temporarily prepare local-only data while the parent repository pulls.
 
-    Excluding deployment-local setup files from the dirty check makes the
-    Update button available, but Git would still reject a pull that changes
-    the same files upstream. Save their exact working-tree contents, restore
-    the repository copies for the pull, and let the caller put the local
-    versions back afterwards.
+    ``programs`` is a user workspace after installation, so preserve its whole
+    tree, including unchanged tracked files and untracked projects. This stops
+    later repository updates from modifying, adding, or deleting any program.
+    Deployment-local setup_default changes are preserved separately.
     """
     listed, output = git_run(
         ["diff", "--name-only", "HEAD", "--", LOCAL_SETUP_PATHSPEC],
@@ -4393,45 +4396,89 @@ def preserve_local_setup_files():
     )
     if not listed:
         return None, output or "Could not inspect local setup files."
-    snapshots = []
+    setup_snapshots = []
     for relative_name in output.splitlines():
         relative_path = Path(relative_name)
         candidate = (ROOT / relative_name).resolve()
-        if (relative_path.parent != Path(".")
-                or not relative_path.name.startswith("setup_default")
-                or not candidate.is_relative_to(ROOT)):
+        is_setup = (relative_path.parent == Path(".")
+                    and relative_path.name.startswith("setup_default"))
+        if (not candidate.is_relative_to(ROOT)
+                or not is_setup):
             return None, f"Refusing to preserve an unexpected setup path: {relative_name}"
         exists = candidate.is_file()
-        snapshots.append({
+        setup_snapshots.append({
             "path": candidate,
             "relative": relative_name,
             "exists": exists,
             "contents": candidate.read_bytes() if exists else None,
             "mode": candidate.stat().st_mode if exists else None,
         })
-    if snapshots:
-        restored, restore_output = git_run(
-            ["restore", "--source=HEAD", "--staged", "--worktree", "--",
-             LOCAL_SETUP_PATHSPEC],
-            cwd=ROOT,
-        )
-        if not restored:
-            return None, restore_output or "Could not prepare local setup files for update."
-    return snapshots, ""
 
+    programs_path = ROOT / "programs"
+    if programs_path.is_symlink():
+        return None, "Refusing to update while the programs directory is a symbolic link."
+    if programs_path.exists() and not programs_path.is_dir():
+        return None, "The programs path exists but is not a directory."
 
-def restore_local_setup_files(snapshots):
-    """Restore setup_default working-tree contents saved before an update."""
     try:
-        for snapshot in snapshots:
-            path = snapshot["path"]
-            if snapshot["exists"]:
-                path.write_bytes(snapshot["contents"])
-                path.chmod(snapshot["mode"] & 0o7777)
+        backup_root = Path(tempfile.mkdtemp(
+            prefix=".ase-studio-programs-backup-", dir=ROOT))
+        programs_backup = backup_root / "programs"
+        programs_existed = programs_path.exists()
+        if programs_existed:
+            shutil.copytree(programs_path, programs_backup, symlinks=True)
+            shutil.rmtree(programs_path)
+    except OSError as error:
+        if "backup_root" in locals():
+            shutil.rmtree(backup_root, ignore_errors=True)
+        return None, f"Could not back up the programs directory: {error}"
+
+    snapshot = {
+        "setupFiles": setup_snapshots,
+        "programsBackupRoot": backup_root,
+        "programsBackup": programs_backup,
+        "programsExisted": programs_existed,
+    }
+    restored, restore_output = git_run(
+        ["restore", "--source=HEAD", "--staged", "--worktree", "--",
+         LOCAL_SETUP_PATHSPEC, "programs"],
+        cwd=ROOT,
+    )
+    if not restored:
+        recovered, recovery_error = restore_local_parent_files(snapshot)
+        message = (restore_output
+                   or "Could not prepare local files for the repository update.")
+        if not recovered:
+            message += "\n" + recovery_error
+        return None, message
+    return snapshot, ""
+
+
+def restore_local_parent_files(snapshot):
+    """Restore the exact local programs tree and saved setup files."""
+    backup_root = snapshot["programsBackupRoot"]
+    programs_backup = snapshot["programsBackup"]
+    programs_path = ROOT / "programs"
+    try:
+        if programs_path.is_symlink() or programs_path.is_file():
+            programs_path.unlink()
+        elif programs_path.exists():
+            shutil.rmtree(programs_path)
+        if snapshot["programsExisted"]:
+            shutil.copytree(programs_backup, programs_path, symlinks=True)
+
+        for setup_snapshot in snapshot["setupFiles"]:
+            path = setup_snapshot["path"]
+            if setup_snapshot["exists"]:
+                path.write_bytes(setup_snapshot["contents"])
+                path.chmod(setup_snapshot["mode"] & 0o7777)
             elif path.exists():
                 path.unlink()
     except OSError as error:
-        return False, f"Could not restore local setup files after update: {error}"
+        return False, (
+            f"Could not restore local program/configuration files: {error}\n"
+            f"The recovery copy is available at {backup_root}")
+    shutil.rmtree(backup_root, ignore_errors=True)
     return True, ""
 
 
@@ -4466,22 +4513,28 @@ def pull_update(discard_local_changes=False):
     ok = True
     parent = status["repositories"][0]
     if parent["available"]:
-        setup_snapshots, setup_error = preserve_local_setup_files()
-        if setup_snapshots is None:
-            message = "Could not preserve local setup files before update:\n" + setup_error
+        local_snapshots, preservation_error = preserve_local_parent_files()
+        if local_snapshots is None:
+            message = ("Could not preserve local project/configuration files before update:\n"
+                       + preservation_error)
             return {"ok": False, "output": message, "advancedOutput": message}
         command = (["pull", "--ff-only", "origin", parent["branch"]]
                    if parent["branch"] else
                    ["merge", "--ff-only", parent["remoteRef"]])
         pulled, output = git_run(command, timeout=90, cwd=ROOT)
-        setup_restored, setup_restore_error = restore_local_setup_files(setup_snapshots)
-        if not setup_restored:
+        local_restored, local_restore_error = restore_local_parent_files(local_snapshots)
+        if not local_restored:
             pulled = False
-            output = ((output + "\n") if output else "") + setup_restore_error
-        elif setup_snapshots:
-            preserved = ", ".join(snapshot["relative"] for snapshot in setup_snapshots)
+            output = ((output + "\n") if output else "") + local_restore_error
+        else:
+            preserved = ["the complete programs directory"]
+            setup_files = local_snapshots["setupFiles"]
+            if setup_files:
+                preserved.append(
+                    "local setup files ("
+                    + ", ".join(item["relative"] for item in setup_files) + ")")
             output = ((output + "\n") if output else "") + (
-                "Preserved local setup configuration: " + preserved)
+                "Preserved " + " and ".join(preserved) + ".")
         ok = ok and pulled
         if output:
             outputs.append(f"Simulator:\n{output}")
