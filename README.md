@@ -80,9 +80,9 @@ without warranty.
 ##
 
 <p align="center">
-  <a href="https://www.polito.it/"><picture><source media="(prefers-color-scheme: dark)" srcset="frontend/polito_dark.png"><img src="frontend/polito_light.png" alt="Politecnico di Torino" height="52"></picture></a>
+  <a href="https://www.polito.it/"><picture><source media="(prefers-color-scheme: dark)" srcset="frontend/polito_dark.png"><img src="frontend/polito_light.png" alt="Politecnico di Torino" height="48"></picture></a>
   &nbsp;&nbsp;&nbsp;
-  <a href="https://cad.polito.it/"><picture><source media="(prefers-color-scheme: dark)" srcset="frontend/cad-dark.webp"><img src="frontend/cad-light.webp" alt="Electronic CAD and Reliability Group" height="52"></picture></a>
+  <a href="https://cad.polito.it/"><picture><source media="(prefers-color-scheme: dark)" srcset="frontend/cad-dark.webp"><img src="frontend/cad-light.webp" alt="Electronic CAD and Reliability Group" height="48"></picture></a>
 </p>
 
 <p align="center"><small>© Politecnico di Torino 2026</small></p> 
