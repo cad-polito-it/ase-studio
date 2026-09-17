@@ -31,6 +31,7 @@ let pipelineSelectTarget = null;
 let externalSyncBusy = false;
 let memoryWatches = [];
 let cpuConfigurationOpenedAs = null;
+let studioFeatures = {memoryConfiguration: false, multiIssueCpu: false};
 
 function closeActionDialog(value) {
   const dialog = $("#message-dialog");
@@ -164,9 +165,25 @@ async function loadStudioVersion() {
   try {
     const health = await api("/api/health");
     $("#about-version").textContent = `Version ${health.version}`;
+    applyDeveloperFeatures(health.features || {});
   } catch (_error) {
     $("#about-version").textContent = "Version unavailable";
+    applyDeveloperFeatures({});
   }
+}
+
+function applyDeveloperFeatures(features) {
+  studioFeatures = {
+    memoryConfiguration: features.memoryConfiguration === true,
+    multiIssueCpu: features.multiIssueCpu === true
+  };
+  $("#cpu-model-field").hidden = !studioFeatures.multiIssueCpu;
+  const multiIssueOption = $("#cpu-model").querySelector('option[value="out-of-order"]');
+  multiIssueOption.hidden = !studioFeatures.multiIssueCpu;
+  multiIssueOption.disabled = !studioFeatures.multiIssueCpu;
+  if (!studioFeatures.multiIssueCpu) $("#cpu-model").value = "in-order";
+  $("#memory-management").hidden = !studioFeatures.memoryConfiguration;
+  updateForwardingControl();
 }
 
 function escapeHtml(text) {
@@ -1328,7 +1345,8 @@ function exportVisiblePipeline() {
 }
 
 function updateForwardingControl() {
-  const outOfOrder = $("#cpu-model").value === "out-of-order";
+  const outOfOrder = studioFeatures.multiIssueCpu
+    && $("#cpu-model").value === "out-of-order";
   $("#forwarding").disabled = outOfOrder;
   if (outOfOrder) $("#forwarding").checked = true;
   $("#forwarding-note").textContent = outOfOrder ? "(results use CDB/ROB forwarding)" : "";
@@ -1351,8 +1369,8 @@ async function openCpuConfiguration() {
   if (!current) return;
   try {
     const config = await api("/api/config?name=" + encodeURIComponent(current.name));
-    cpuConfigurationOpenedAs = config.cpu;
-    $("#cpu-model").value = config.cpu;
+    cpuConfigurationOpenedAs = studioFeatures.multiIssueCpu ? config.cpu : "in-order";
+    $("#cpu-model").value = studioFeatures.multiIssueCpu ? config.cpu : "in-order";
     $("#int-alu").value = config.intAlu;
     $("#int-mul").value = config.intMul;
     $("#int-div").value = config.intDiv;

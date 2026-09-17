@@ -58,6 +58,10 @@ GEM5_ISA = "RISCV"
 GEM5_VARIANT = "opt"
 OFFICIAL_GEM5_REPOSITORY = "github.com/cad-polito-it/gem5"
 REQUIRED_BRANCHES_FILE = ROOT / "ase_studio_branches.json"
+
+ENABLE_MEMORY_CONFIGURATION = False
+ENABLE_MULTI_ISSUE_CPU = False
+
 LOCAL_SETUP_PATHSPEC = "setup_default*"
 LOCAL_PROGRAM_PATHSPEC = "programs/**"
 LOCAL_PARENT_PATHSPECS = (LOCAL_SETUP_PATHSPEC, LOCAL_PROGRAM_PATHSPEC)
@@ -177,7 +181,8 @@ def validate_config(value):
     config = DEFAULT_CONFIG.copy()
     if value.get("cpu") not in {"in-order", "out-of-order"}:
         fail("Select an in-order or out-of-order CPU.")
-    config["cpu"] = value["cpu"]
+    config["cpu"] = (value["cpu"] if ENABLE_MULTI_ISSUE_CPU
+                     else DEFAULT_CONFIG["cpu"])
     for key in ("intAlu", "intMul", "intDiv", "floatAlu", "floatMul", "floatDiv"):
         number = value.get(key)
         if not isinstance(number, int) or isinstance(number, bool) or not 1 <= number <= 100:
@@ -291,6 +296,13 @@ def validate_config(value):
     config["o3EvaluationLabel"] = start_label
     if config["cacheLine"] & (config["cacheLine"] - 1):
         fail("Cache-line size must be a power of two.")
+    if not ENABLE_MEMORY_CONFIGURATION:
+        for key in (
+            "memoryMode", "cacheStalls", "instructionMemoryLatency",
+            "dataReadLatency", "dataWriteLatency", "iCacheSize",
+            "dCacheSize", "cacheLine", "cacheLatency", "memoryLatency",
+        ):
+            config[key] = DEFAULT_CONFIG[key]
     if config["cpu"] == "out-of-order":
         config["forwarding"] = True
     return config
@@ -4602,7 +4614,12 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({"projects": sorted(p.name for p in PROGRAMS.iterdir() if p.is_dir())})
             if url.path == "/api/health":
                 return self.send_json({"ok": True, "apiVersion": STUDIO_API_VERSION,
-                                       "version": STUDIO_VERSION})
+                                       "version": STUDIO_VERSION,
+                                       "features": {
+                                           "memoryConfiguration":
+                                               ENABLE_MEMORY_CONFIGURATION,
+                                           "multiIssueCpu": ENABLE_MULTI_ISSUE_CPU,
+                                       }})
             if url.path == "/api/update-status":
                 return self.send_json(update_status(refresh=True))
             if url.path == "/api/environment":
