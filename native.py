@@ -29,11 +29,55 @@ from ase_studio.backend import (  # noqa: E402
 from http.server import ThreadingHTTPServer  # noqa: E402
 
 
-def create_server(preferred_port: int) -> ThreadingHTTPServer:
+def parse_cli_args(args: list[str]) -> tuple[str, int]:
+    host = os.environ.get("ASE_STUDIO_HOST", "127.0.0.1") or "127.0.0.1"
     try:
-        return ThreadingHTTPServer(("127.0.0.1", preferred_port), Handler)
+        port = int(os.environ.get("ASE_STUDIO_PORT", "8765"))
+    except ValueError:
+        port = 8765
+    positional_port: str | None = None
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--host" and index + 1 < len(args):
+            host = args[index + 1]
+            index += 2
+        elif arg.startswith("--host="):
+            host = arg.split("=", 1)[1]
+            index += 1
+        elif arg == "--port" and index + 1 < len(args):
+            positional_port = args[index + 1]
+            index += 2
+        elif arg.startswith("--port="):
+            positional_port = arg.split("=", 1)[1]
+            index += 1
+        elif not arg.startswith("--") and positional_port is None:
+            positional_port = arg
+            index += 1
+        else:
+            print(f"Unknown option: {arg}", file=sys.stderr)
+            raise SystemExit(2)
+    if positional_port is not None:
+        try:
+            port = int(positional_port)
+        except ValueError:
+            print(f"Invalid port: {positional_port} (expected 1-65535).",
+                  file=sys.stderr)
+            raise SystemExit(2)
+    if not host:
+        print("Host cannot be empty.", file=sys.stderr)
+        raise SystemExit(2)
+    if not 1 <= port <= 65535:
+        print(f"Invalid port: {port} (expected 1-65535).", file=sys.stderr)
+        raise SystemExit(2)
+    return host, port
+
+
+def create_server(host: str, preferred_port: int) -> ThreadingHTTPServer:
+    try:
+        return ThreadingHTTPServer((host, preferred_port), Handler)
     except OSError:
-        return ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        return ThreadingHTTPServer((host, 0), Handler)
 
 
 def main() -> int:
@@ -57,7 +101,7 @@ def main() -> int:
         dialog.run()
         dialog.destroy()
         return 1
-    preferred_port = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
+    preferred_host, preferred_port = parse_cli_args(sys.argv[1:])
 
     application = Gtk.Application(application_id=APPLICATION_ID)
     server = None
@@ -83,9 +127,13 @@ def main() -> int:
         # down. Otherwise destroying the last window can end the loop before
         # WebKitGTK has released its page and signal handlers.
         app.hold()
-        server = create_server(preferred_port)
+        server = create_server(preferred_host, preferred_port)
         server_thread = threading.Thread(target=server.serve_forever, daemon=True)
         server_thread.start()
+        server_port = server.server_address[1]
+        # A wildcard bind cannot be loaded directly, so point the embedded
+        # WebView at loopback while the server listens on all interfaces.
+        loopback_uri = f"http://127.0.0.1:{server_port}"
 
         window = Gtk.ApplicationWindow(application=app, title="ASE Studio")
         # GLib.set_prgname supplies ASEStudio as the X11 WM_CLASS. The GTK
@@ -98,6 +146,14 @@ def main() -> int:
         view = WebKit2.WebView()
         view.get_settings().set_property("enable-developer-extras", False)
 
+        def is_internal_uri(uri: str) -> bool:
+            return uri.startswith((
+                f"http://127.0.0.1:{server_port}",
+                f"http://localhost:{server_port}",
+                f"http://0.0.0.0:{server_port}",
+                f"http://[::1]:{server_port}",
+            ))
+
         def open_external_links(_view, decision, decision_type):
             if decision_type not in {
                     WebKit2.PolicyDecisionType.NAVIGATION_ACTION,
@@ -106,7 +162,7 @@ def main() -> int:
             navigation = decision.get_navigation_action()
             uri = navigation.get_request().get_uri()
             if (uri.startswith(("https://", "http://", "mailto:"))
-                    and not uri.startswith("http://127.0.0.1:")):
+                    and not is_internal_uri(uri)):
                 decision.ignore()
                 Gio.AppInfo.launch_default_for_uri(uri, None)
                 return True
@@ -191,7 +247,7 @@ def main() -> int:
 
         web_context = view.get_context()
         download_handler = web_context.connect("download-started", handle_download)
-        view.load_uri(f"http://127.0.0.1:{server.server_address[1]}")
+        view.load_uri(loopback_uri)
         window.add(view)
 
         def show_exit_confirmation(has_unsaved_changes: bool) -> bool:

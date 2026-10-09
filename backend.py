@@ -5590,28 +5590,89 @@ TEMPLATE = "# Add an optional .data section here.\n\n# The text section contains
 MAKEFILE = "ASM = ./main.s\ninclude $(ASE_STUDIO_DEMO_MK)\n"
 
 if __name__ == "__main__":
+    cli_args = sys.argv[1:]
+    if "--help" in cli_args or "-h" in cli_args:
+        print("Usage: backend.py [--host HOST] [--port PORT] [PORT] [--open] [--check-startup]")
+        print("  --host HOST  Interface to bind (default: 127.0.0.1, or ASE_STUDIO_HOST).")
+        print("               Use 0.0.0.0 to allow connections from other machines.")
+        print("  --port PORT  Port to bind (default: 8765, or ASE_STUDIO_PORT).")
+        print("  --open       Open the printed URL in the default browser.")
+        raise SystemExit(0)
     try:
         require_startup_repositories()
     except ValueError as error:
         message, _status = error.args[0]
         print(message, file=sys.stderr)
         raise SystemExit(1)
-    if "--check-startup" in sys.argv:
+    if "--check-startup" in cli_args:
         if DEVELOPER_MODE:
             print("ASE Studio startup check completed in developer mode.")
         else:
             print("ASE Studio repository branches are valid.")
         raise SystemExit(0)
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
+    host = os.environ.get("ASE_STUDIO_HOST", "127.0.0.1") or "127.0.0.1"
     try:
-        server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+        port = int(os.environ.get("ASE_STUDIO_PORT", "8765"))
+    except ValueError:
+        port = 8765
+    open_browser = False
+    positional_port = None
+    index = 0
+    while index < len(cli_args):
+        arg = cli_args[index]
+        if arg == "--host" and index + 1 < len(cli_args):
+            host = cli_args[index + 1]
+            index += 2
+        elif arg.startswith("--host="):
+            host = arg.split("=", 1)[1]
+            index += 1
+        elif arg == "--port" and index + 1 < len(cli_args):
+            positional_port = cli_args[index + 1]
+            index += 2
+        elif arg.startswith("--port="):
+            positional_port = arg.split("=", 1)[1]
+            index += 1
+        elif arg == "--open":
+            open_browser = True
+            index += 1
+        elif arg == "--check-startup":
+            index += 1
+        elif not arg.startswith("--") and positional_port is None:
+            positional_port = arg
+            index += 1
+        else:
+            print(f"Unknown option: {arg}", file=sys.stderr)
+            raise SystemExit(2)
+    if positional_port is not None:
+        try:
+            port = int(positional_port)
+        except ValueError:
+            print(f"Invalid port: {positional_port} (expected 1-65535).", file=sys.stderr)
+            raise SystemExit(2)
+    if not host:
+        print("Host cannot be empty.", file=sys.stderr)
+        raise SystemExit(2)
+    if not 1 <= port <= 65535:
+        print(f"Invalid port: {port} (expected 1-65535).", file=sys.stderr)
+        raise SystemExit(2)
+    try:
+        server = ThreadingHTTPServer((host, port), Handler)
     except OSError:
-        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server = ThreadingHTTPServer((host, 0), Handler)
         print(f"Port {port} is already occupied; using a new port.", flush=True)
     actual_port = server.server_address[1]
-    url = f"http://127.0.0.1:{actual_port}"
-    print(f"ASE Studio: {url}", flush=True)
-    if "--open" in sys.argv:
+    # A wildcard bind cannot be opened directly, so advertise loopback while
+    # noting the actual listening interface.
+    display_host = "127.0.0.1" if host in {"0.0.0.0", "::", ""} else host
+    url = f"http://{display_host}:{actual_port}"
+    if display_host != host:
+        print(f"ASE Studio: {url} (listening on {host}:{actual_port})", flush=True)
+    else:
+        print(f"ASE Studio: {url}", flush=True)
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        print("Warning: ASE Studio has no authentication; "
+              f"listening on {host} exposes it to the network.", flush=True)
+    if open_browser:
         webbrowser.open(url)
     try:
         server.serve_forever()
