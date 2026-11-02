@@ -25,6 +25,9 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
+import uuid
 import warnings
 import webbrowser
 import zipfile
@@ -75,6 +78,24 @@ GEM5_VARIANT = "opt"
 OFFICIAL_GEM5_REPOSITORY = "github.com/cad-polito-it/gem5"
 REQUIRED_BRANCHES_FILE = ROOT / "ase_studio_branches.json"
 DEVELOPER_MODE_ENVIRONMENT_VARIABLE = "ASE_STUDIO_DEVELOPER"
+PORTAL_API = os.environ.get(
+    "ASE_STUDIO_PORTAL_API", "https://app.didattica.polito.it/api").rstrip("/")
+PORTAL_SSO_START = "https://app.didattica.polito.it/auth/students/start"
+PORTAL_SSO_CALLBACK = "polito://students/login"
+PORTAL_SSO_TIMEOUT = 15 * 60
+PORTAL_REQUEST_TIMEOUT = 30
+PORTAL_UPLOAD_TIMEOUT = 300
+PORTAL_KEYRING_SERVICE = "ASE Studio Portale"
+# Uploads always go to Architetture dei sistemi di elaborazione (02GOL..) or
+# its English edition, Computer architectures (02LSE..). The course id changes
+# every academic year and the last two letters of the shortcode depend on the
+# degree programme, so the course is found by the first five characters.
+PORTAL_COURSE_CODES = tuple(
+    code.strip().upper()[:5] for code in
+    os.environ.get("ASE_STUDIO_PORTAL_COURSE", "02GOL,02LSE").split(",") if code.strip())
+PORTAL_KEYRING_ACCOUNT = "portal-session"
+# native.py installs a callable(uid, url) that shows the PoliTO sign-in page.
+PORTAL_SSO_OPENER = None
 
 
 def developer_mode_enabled(environment=None):
@@ -5115,8 +5136,8 @@ def create_submission(projects, assignment, attachments=None, expand_loops=False
             "projects": [entry["name"] for entry in selected_projects]}
 
 
-def reveal_submission_folder(archive_path):
-    """Open the file manager at a completed submission's directory."""
+def submission_archive_file(archive_path):
+    """Resolve a generated submission ZIP inside the submission directory."""
     if not isinstance(archive_path, str) or not archive_path:
         fail("The submission archive path is missing.")
     submissions_root = active_submission_directory()
@@ -5127,6 +5148,12 @@ def reveal_submission_folder(archive_path):
         fail("Invalid submission archive path.")
     if not archive.is_file() or archive.suffix.lower() != ".zip":
         fail("The submission ZIP could not be found.", 404)
+    return archive
+
+
+def reveal_submission_folder(archive_path):
+    """Open the file manager at a completed submission's directory."""
+    archive = submission_archive_file(archive_path)
     if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
         fail("A Linux desktop session is required to open the submission folder.")
     opener = shutil.which("xdg-open")
@@ -5145,6 +5172,580 @@ def reveal_submission_folder(archive_path):
         fail(f"The submission folder could not be opened: {error}", 500)
     return {"ok": True,
             "folder": portable_environment_value(str(archive.parent))}
+
+
+# Portale della Didattica uploads use the PoliTO students API. Tokens stay in
+# memory unless the student asks to be remembered; passwords are never stored.
+_PORTAL_LOCK = threading.Lock()
+_PORTAL_SESSION = None
+_PORTAL_SESSION_LOADED = False
+_PORTAL_SSO = {}
+_PORTAL_COURSE = {}
+
+
+def portal_credentials_path() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(base) / "ase-studio" / "portal.json"
+
+
+def portal_keyring():
+    """Return the operating-system credential store available here, if any."""
+    if sys.platform == "darwin" and os.access("/usr/bin/security", os.X_OK):
+        return "macOS Keychain"
+    if shutil.which("secret-tool") and os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+        return "system keyring"
+    return None
+
+
+def portal_keyring_run(arguments, stdin=""):
+    try:
+        result = subprocess.run(arguments, input=stdin, capture_output=True,
+                                text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def portal_keyring_store(secret):
+    """Store the remembered session in the OS keyring; return success."""
+    keyring = portal_keyring()
+    # Base64 keeps the secret free of quotes and off the command line.
+    encoded = base64.b64encode(secret.encode("utf-8")).decode("ascii")
+    if keyring == "macOS Keychain":
+        return portal_keyring_run(
+            ["/usr/bin/security", "-i"],
+            f"add-generic-password -U -s \"{PORTAL_KEYRING_SERVICE}\" "
+            f"-a {PORTAL_KEYRING_ACCOUNT} -w {encoded}\n") is not None
+    if keyring == "system keyring":
+        return portal_keyring_run(
+            ["secret-tool", "store", f"--label={PORTAL_KEYRING_SERVICE}",
+             "service", PORTAL_KEYRING_SERVICE, "account", PORTAL_KEYRING_ACCOUNT],
+            encoded) is not None
+    return False
+
+
+def portal_keyring_load():
+    keyring = portal_keyring()
+    if keyring == "macOS Keychain":
+        output = portal_keyring_run(
+            ["/usr/bin/security", "find-generic-password", "-s",
+             PORTAL_KEYRING_SERVICE, "-a", PORTAL_KEYRING_ACCOUNT, "-w"])
+    elif keyring == "system keyring":
+        output = portal_keyring_run(
+            ["secret-tool", "lookup", "service", PORTAL_KEYRING_SERVICE,
+             "account", PORTAL_KEYRING_ACCOUNT])
+    else:
+        output = None
+    if not output:
+        return None
+    try:
+        return base64.b64decode(output.strip(), validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError):
+        return None
+
+
+def portal_keyring_delete():
+    keyring = portal_keyring()
+    if keyring == "macOS Keychain":
+        portal_keyring_run(["/usr/bin/security", "delete-generic-password", "-s",
+                            PORTAL_KEYRING_SERVICE, "-a", PORTAL_KEYRING_ACCOUNT])
+    elif keyring == "system keyring":
+        portal_keyring_run(["secret-tool", "clear", "service", PORTAL_KEYRING_SERVICE,
+                            "account", PORTAL_KEYRING_ACCOUNT])
+
+
+def portal_remove_credentials_file():
+    try:
+        portal_credentials_path().unlink()
+    except OSError:
+        pass
+
+
+def portal_session():
+    """Return the active portal session, loading remembered credentials once."""
+    global _PORTAL_SESSION, _PORTAL_SESSION_LOADED
+    with _PORTAL_LOCK:
+        if not _PORTAL_SESSION_LOADED:
+            _PORTAL_SESSION_LOADED = True
+            storage = "keyring"
+            raw = portal_keyring_load()
+            if raw is None:
+                storage = "file"
+                try:
+                    raw = portal_credentials_path().read_text(encoding="utf-8")
+                except OSError:
+                    raw = None
+            try:
+                stored = json.loads(raw) if raw else None
+            except ValueError:
+                stored = None
+            if (isinstance(stored, dict)
+                    and isinstance(stored.get("token"), str) and stored["token"]
+                    and isinstance(stored.get("username"), str)):
+                client_id = stored.get("clientId")
+                _PORTAL_SESSION = {
+                    "username": stored["username"], "token": stored["token"],
+                    "clientId": client_id if isinstance(client_id, str) else None,
+                    "remembered": True, "storage": storage,
+                }
+        return dict(_PORTAL_SESSION) if _PORTAL_SESSION else None
+
+
+def portal_require_session():
+    session = portal_session()
+    if not session:
+        fail("Sign in to the Portale della Didattica first.", 401)
+    return session
+
+
+def portal_write_credentials(session):
+    """Remember a session in the OS keyring, or else in a private file."""
+    secret = json.dumps({key: session[key] for key in ("username", "token", "clientId")})
+    if portal_keyring_store(secret):
+        portal_remove_credentials_file()
+        return "keyring"
+    path = portal_credentials_path()
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        temporary.unlink()
+    except FileNotFoundError:
+        pass
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(secret)
+    os.replace(temporary, path)
+    return "file"
+
+
+def portal_store_session(session, remember):
+    """Activate a session; return whether it was saved for later launches."""
+    global _PORTAL_SESSION, _PORTAL_SESSION_LOADED
+    with _PORTAL_LOCK:
+        _PORTAL_SESSION_LOADED = True
+        storage = ""
+        if remember:
+            try:
+                storage = portal_write_credentials(session)
+            except OSError:
+                pass
+        if not storage:
+            portal_keyring_delete()
+            portal_remove_credentials_file()
+        _PORTAL_SESSION = {**session, "remembered": bool(storage), "storage": storage}
+        return bool(storage)
+
+
+def portal_clear_session(token=None):
+    """Forget the session, or only the given token if a newer one replaced it."""
+    global _PORTAL_SESSION, _PORTAL_SESSION_LOADED
+    with _PORTAL_LOCK:
+        if token and _PORTAL_SESSION and _PORTAL_SESSION["token"] != token:
+            return
+        _PORTAL_SESSION = None
+        _PORTAL_SESSION_LOADED = True
+        portal_keyring_delete()
+        portal_remove_credentials_file()
+
+
+def portal_error_message(raw):
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return ""
+    message = data.get("message") if isinstance(data, dict) else None
+    return message.strip()[:300] if isinstance(message, str) else ""
+
+
+def portal_request(method, path, token=None, body=None, content_type=None,
+                   missing_ok=False, timeout=PORTAL_REQUEST_TIMEOUT):
+    """Call the students API and map its failures to ASE Studio errors."""
+    headers = {"Accept": "application/json",
+               "User-Agent": f"ASE-Studio/{STUDIO_VERSION}"}
+    if isinstance(body, (dict, list)):
+        body = json.dumps(body).encode("utf-8")
+        content_type = "application/json"
+    if content_type:
+        headers["Content-Type"] = content_type
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(PORTAL_API + path, data=body,
+                                     method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as error:
+        try:
+            message = portal_error_message(error.read())
+        except OSError:
+            message = ""
+        if missing_ok and error.code == 404:
+            return None
+        if token and error.code in {401, 403}:
+            portal_clear_session(token)
+            fail("Your Portale della Didattica session has expired. Sign in again.",
+                 401)
+        if not token and 400 <= error.code < 500:
+            fail(message or f"The Portale della Didattica rejected the sign-in "
+                            f"(HTTP {error.code}).")
+        fail(message or f"The Portale della Didattica returned HTTP {error.code}.",
+             502)
+    except (urllib.error.URLError, OSError) as error:
+        reason = getattr(error, "reason", None) or error
+        fail(f"The Portale della Didattica could not be reached: {reason}", 502)
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except ValueError:
+        fail("The Portale della Didattica returned an unexpected response.", 502)
+
+
+def portal_build_number(version=STUDIO_VERSION):
+    parts = [int(part) for part in re.findall(r"\d+", version)[:3]]
+    parts += [0] * (3 - len(parts))
+    return "".join(f"{min(part, 99):02d}" for part in parts)
+
+
+def portal_login(credentials, remember):
+    """Exchange basic or SSO credentials for a student API token."""
+    previous = portal_session()
+    client = {"name": "ASE Studio", "appVersion": STUDIO_VERSION,
+              "buildNumber": portal_build_number()}
+    if previous and previous.get("clientId"):
+        client["id"] = previous["clientId"]
+    response = portal_request("POST", "/auth/login", body={
+        **credentials,
+        "preferences": {"language": "en"},
+        "client": client,
+        "device": {"platform": "linux", "toothPicCompatible": False},
+    })
+    data = response.get("data") if isinstance(response, dict) else None
+    token = data.get("token") if isinstance(data, dict) else None
+    if not isinstance(token, str) or not token:
+        fail("The Portale della Didattica did not return a session.", 502)
+    if data.get("type") != "student":
+        try:
+            portal_request("DELETE", "/auth/logout", token)
+        except ValueError:
+            pass
+        fail("Only student accounts can upload Elaborati.", 403)
+    client_id = data.get("clientId")
+    portal_store_session({
+        "username": str(data.get("username") or ""),
+        "token": token,
+        "clientId": client_id if isinstance(client_id, str) else None,
+    }, remember)
+    return portal_status()
+
+
+def portal_status():
+    session = portal_session()
+    return {"ok": True, "loggedIn": bool(session),
+            "username": session["username"] if session else "",
+            "remembered": bool(session and session["remembered"]),
+            "storage": session.get("storage", "") if session else "",
+            "keyring": portal_keyring() or "",
+            "ssoAvailable": PORTAL_SSO_OPENER is not None}
+
+
+def portal_basic_login(username, password, remember=False):
+    if not isinstance(username, str) or not username.strip() or len(username) > 64:
+        fail("Enter your PoliTO username.")
+    if not isinstance(password, str) or not password or len(password) > 256:
+        fail("Enter your password.")
+    if not isinstance(remember, bool):
+        fail("Invalid sign-in option.")
+    return portal_login({"loginType": "basic", "username": username.strip(),
+                         "password": password}, remember)
+
+
+def portal_logout():
+    session = portal_session()
+    if session:
+        try:
+            portal_request("DELETE", "/auth/logout", session["token"])
+        except ValueError:
+            pass
+        portal_clear_session()
+    return portal_status()
+
+
+def portal_sso_start(remember=False):
+    """Register a pending SSO sign-in and show the PoliTO login page."""
+    opener = PORTAL_SSO_OPENER
+    if opener is None:
+        fail("PoliTO single sign-on requires the ASE Studio desktop window.")
+    if not isinstance(remember, bool):
+        fail("Invalid sign-in option.")
+    uid = str(uuid.uuid4())
+    now = time.monotonic()
+    with _PORTAL_LOCK:
+        for key, entry in list(_PORTAL_SSO.items()):
+            if now - entry["started"] > PORTAL_SSO_TIMEOUT:
+                del _PORTAL_SSO[key]
+            elif entry["state"] == "pending":
+                entry["state"] = "cancelled"
+        _PORTAL_SSO[uid] = {"state": "pending", "started": now, "error": "",
+                            "remember": remember}
+    try:
+        opener(uid, f"{PORTAL_SSO_START}?platform=linux&uid={uid}")
+    except Exception as error:
+        with _PORTAL_LOCK:
+            _PORTAL_SSO[uid].update(state="error", error=str(error))
+        fail(f"The PoliTO sign-in window could not be opened: {error}", 500)
+    return {"ok": True, "uid": uid}
+
+
+def portal_sso_state(uid):
+    with _PORTAL_LOCK:
+        entry = _PORTAL_SSO.get(uid)
+        if entry is None:
+            fail("Unknown sign-in request.", 404)
+        if (entry["state"] == "pending"
+                and time.monotonic() - entry["started"] > PORTAL_SSO_TIMEOUT):
+            entry.update(state="error", error="The PoliTO sign-in timed out.")
+        state, error = entry["state"], entry["error"]
+    result = {"ok": True, "state": state, "error": error}
+    if state == "done":
+        result.update(portal_status())
+    return result
+
+
+def portal_sso_cancel(uid):
+    with _PORTAL_LOCK:
+        entry = _PORTAL_SSO.get(uid)
+        if entry and entry["state"] == "pending":
+            entry["state"] = "cancelled"
+    return {"ok": True}
+
+
+def portal_sso_complete(uid, key):
+    """Finish a pending SSO sign-in; errors are recorded, never raised."""
+    with _PORTAL_LOCK:
+        entry = _PORTAL_SSO.get(uid)
+        if entry is None or entry["state"] != "pending":
+            return
+        entry["state"] = "completing"
+        remember = entry["remember"]
+    try:
+        if not key:
+            fail("The PoliTO sign-in did not return a session key.")
+        portal_login({"loginType": "sso", "uid": uid, "key": key}, remember)
+        state, message = "done", ""
+    except ValueError as error:
+        state, message = "error", error.args[0][0]
+    except Exception as error:
+        state, message = "error", str(error)
+    with _PORTAL_LOCK:
+        entry.update(state=state, error=message)
+
+
+def portal_sso_callback(url):
+    """Complete SSO from the polito://students/login redirect URL."""
+    query = parse_qs(urlparse(url).query)
+    portal_sso_complete(query.get("uid", [""])[0], query.get("key", [""])[0])
+
+
+def portal_courses():
+    """Return the student's courses and modules, flattened and de-duplicated."""
+    session = portal_require_session()
+    response = portal_request("GET", "/v2/courses", session["token"],
+                              missing_ok=True)
+    if response is None:
+        response = portal_request("GET", "/courses", session["token"])
+    courses = []
+    seen = set()
+    for course in response.get("data") or []:
+        if not isinstance(course, dict):
+            continue
+        entries = [course] + [module for module in course.get("modules") or []
+                              if isinstance(module, dict)]
+        for entry in entries:
+            course_id = entry.get("id")
+            if (not isinstance(course_id, int) or isinstance(course_id, bool)
+                    or course_id in seen):
+                continue
+            seen.add(course_id)
+            courses.append({
+                "id": course_id,
+                "name": str(entry.get("name") or course.get("name") or course_id),
+                "shortcode": str(entry.get("shortcode")
+                                 or course.get("shortcode") or ""),
+                "year": entry.get("year") or course.get("year"),
+            })
+    return {"ok": True, "courses": courses}
+
+
+def portal_assignment_summary(assignment):
+    return {key: assignment.get(key) for key in (
+        "id", "description", "filename", "mimeType", "uploadedAt", "deletedAt",
+        "sizeInKiloBytes", "url")}
+
+
+def portal_course():
+    """Return the ASE course of the signed-in student, newest year first."""
+    token = portal_require_session()["token"]
+    with _PORTAL_LOCK:
+        if _PORTAL_COURSE.get("token") == token:
+            return dict(_PORTAL_COURSE["course"])
+    matches = [course for course in portal_courses()["courses"]
+               if course["shortcode"].upper()[:5] in PORTAL_COURSE_CODES]
+    if not matches:
+        fail("Your PoliTO account is not enrolled in Architetture dei sistemi di "
+             "elaborazione or Computer architectures on the Portale della Didattica.")
+    course = max(matches, key=lambda entry: (entry["year"] or 0, entry["id"]))
+    with _PORTAL_LOCK:
+        _PORTAL_COURSE.update(token=token, course=course)
+    return dict(course)
+
+
+def portal_course_assignments(course_id, token):
+    response = portal_request("GET", f"/courses/{course_id}/assignments", token)
+    return [entry for entry in response.get("data") or []
+            if isinstance(entry, dict)]
+
+
+def portal_assignments():
+    """List the ASE course's Elaborati, newest first, including withdrawn ones."""
+    course = portal_course()
+    token = portal_require_session()["token"]
+    entries = sorted(portal_course_assignments(course["id"], token),
+                     key=lambda entry: str(entry.get("uploadedAt") or ""),
+                     reverse=True)
+    return {"ok": True, "course": course,
+            "assignments": [portal_assignment_summary(entry) for entry in entries]}
+
+
+def portal_set_withdrawn(assignment_id, withdrawn):
+    """Withdraw an Elaborato of the ASE course or restore a withdrawn one."""
+    course_id = portal_course()["id"]
+    if (not isinstance(assignment_id, int) or isinstance(assignment_id, bool)
+            or assignment_id <= 0):
+        fail("Invalid Elaborato.")
+    if not isinstance(withdrawn, bool):
+        fail("Invalid Elaborato action.")
+    token = portal_require_session()["token"]
+    deleted_at = (datetime.now(timezone.utc).isoformat(timespec="seconds")
+                  .replace("+00:00", "Z") if withdrawn else None)
+    portal_request("PATCH", f"/courses/{course_id}/assignments/{assignment_id}",
+                   token, {"deletedAt": deleted_at})
+    return portal_assignments()
+
+
+def submission_archive_preview(archive_path):
+    """Describe a submission ZIP: its name, size, and the files it contains."""
+    archive = submission_archive_file(archive_path)
+    try:
+        with zipfile.ZipFile(archive) as bundle:
+            entries = [{"path": info.filename, "size": info.file_size}
+                       for info in bundle.infolist() if not info.is_dir()]
+    except zipfile.BadZipFile:
+        fail("The submission ZIP is damaged.")
+    return {"filename": archive.name, "description": archive.stem,
+            "size": archive.stat().st_size, "entries": entries}
+
+
+def portal_upload_preview(archive_path):
+    """Show how a ZIP will appear in Elaborati and what it would duplicate."""
+    preview = submission_archive_preview(archive_path)
+    course = portal_course()
+    token = portal_require_session()["token"]
+    existing = [portal_assignment_summary(entry)
+                for entry in portal_course_assignments(course["id"], token)
+                if entry.get("filename") == preview["filename"]
+                and not entry.get("deletedAt")]
+    return {"ok": True, "course": course, **preview, "existing": existing}
+
+
+def portal_multipart(fields, filename, content, mime_type):
+    boundary = f"----ASEStudio{uuid.uuid4().hex}"
+    parts = []
+    for name, value in fields.items():
+        parts.append((f'--{boundary}\r\nContent-Disposition: form-data; '
+                      f'name="{name}"\r\n\r\n{value}\r\n').encode("utf-8"))
+    quoted = filename.replace("\\", "\\\\").replace('"', '\\"')
+    parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="file"; '
+                  f'filename="{quoted}"\r\nContent-Type: {mime_type}\r\n\r\n')
+                 .encode("utf-8"))
+    parts.append(content)
+    parts.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+
+
+def portal_upload(archive_path, description=None, replace=None):
+    """Upload a submission ZIP to the ASE course's Elaborati and confirm it.
+
+    With replace=None, an existing active upload with the same filename is
+    reported as a conflict instead of being duplicated. With replace=True the
+    older copies are withdrawn only after the new upload has been confirmed.
+    """
+    archive = submission_archive_file(archive_path)
+    course_id = portal_course()["id"]
+    if description is None:
+        description = archive.stem
+    if (not isinstance(description, str) or not description.strip()
+            or len(description) > 200
+            or any(ord(character) < 32 for character in description)):
+        fail("Invalid Elaborato description.")
+    if replace is not None and not isinstance(replace, bool):
+        fail("Invalid upload option.")
+    token = portal_require_session()["token"]
+
+    existing = portal_course_assignments(course_id, token)
+    duplicates = [entry for entry in existing
+                  if entry.get("filename") == archive.name
+                  and not entry.get("deletedAt")]
+    if duplicates and replace is None:
+        return {"ok": False, "conflict": True,
+                "existing": [portal_assignment_summary(entry)
+                             for entry in duplicates]}
+
+    body, content_type = portal_multipart(
+        {"description": description.strip()}, archive.name,
+        archive.read_bytes(), "application/zip")
+    portal_request("POST", f"/courses/{course_id}/assignments", token, body,
+                   content_type, timeout=PORTAL_UPLOAD_TIMEOUT)
+
+    warnings_list = []
+    uploaded = None
+    try:
+        known = {entry.get("id") for entry in existing}
+        candidates = [entry for entry in portal_course_assignments(course_id, token)
+                      if entry.get("filename") == archive.name
+                      and not entry.get("deletedAt")
+                      and entry.get("id") not in known]
+        if candidates:
+            uploaded = max(candidates, key=lambda entry: entry.get("id") or 0)
+        else:
+            warnings_list.append("The upload was accepted but does not appear "
+                                 "in the course's Elaborati yet.")
+    except ValueError as error:
+        warnings_list.append("The upload was accepted but could not be "
+                             f"verified: {error.args[0][0]}")
+
+    withdrawn = []
+    if replace and duplicates:
+        if uploaded is None:
+            warnings_list.append("The previous copies were kept because the new "
+                                 "upload could not be confirmed.")
+        else:
+            withdrawn_at = (datetime.now(timezone.utc).isoformat(timespec="seconds")
+                            .replace("+00:00", "Z"))
+            for entry in duplicates:
+                try:
+                    portal_request(
+                        "PATCH", f"/courses/{course_id}/assignments/{entry['id']}",
+                        token, {"deletedAt": withdrawn_at})
+                    withdrawn.append(entry["id"])
+                except ValueError as error:
+                    warnings_list.append(f"Elaborato {entry['id']} could not be "
+                                         f"withdrawn: {error.args[0][0]}")
+    return {"ok": True, "verified": uploaded is not None,
+            "assignment": portal_assignment_summary(uploaded) if uploaded else None,
+            "withdrawn": withdrawn, "warnings": warnings_list,
+            "filename": archive.name, "course": portal_course()}
 
 
 def git_run(args, timeout=20, cwd=ROOT):
@@ -6016,6 +6617,15 @@ class Handler(SimpleHTTPRequestHandler):
     def send_json(self, value, status=200):
         data = json.dumps(value).encode()
         self.send_response(status); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
+    def send_file_download(self, path, content_type):
+        data = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Disposition",
+                         f'attachment; filename="{path.name}"')
+        self.end_headers()
+        self.wfile.write(data)
     def read_json(self):
         size = int(self.headers.get("Content-Length", "0"))
         return json.loads(self.rfile.read(size))
@@ -6068,6 +6678,19 @@ class Handler(SimpleHTTPRequestHandler):
             if url.path == "/api/config":
                 folder = project_dir(parse_qs(url.query).get("name", [""])[0])
                 return self.send_json(project_config(folder))
+            if url.path == "/api/portal/status":
+                return self.send_json(portal_status())
+            if url.path == "/api/portal/course":
+                return self.send_json({"ok": True, "course": portal_course()})
+            if url.path == "/api/portal/assignments":
+                return self.send_json(portal_assignments())
+            if url.path == "/api/submission/download":
+                archive = submission_archive_file(
+                    parse_qs(url.query).get("archive", [""])[0])
+                return self.send_file_download(archive, "application/zip")
+            if url.path == "/api/portal/sso":
+                return self.send_json(portal_sso_state(
+                    parse_qs(url.query).get("uid", [""])[0]))
             if url.path == "/": self.path = "/index.html"
             if url.path.startswith("/api/"): return self.send_json({"error": "Not found"}, 404)
             return super().do_GET()
@@ -6125,6 +6748,28 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json(pull_update(discard))
             if self.path == "/api/open-with":
                 return self.send_json(open_with_editor(data.get("name")))
+            if self.path == "/api/portal/login":
+                return self.send_json(portal_basic_login(
+                    data.get("username"), data.get("password"),
+                    data.get("remember", False)))
+            if self.path == "/api/portal/logout":
+                return self.send_json(portal_logout())
+            if self.path == "/api/portal/sso/start":
+                return self.send_json(portal_sso_start(data.get("remember", False)))
+            if self.path == "/api/portal/sso/cancel":
+                return self.send_json(portal_sso_cancel(data.get("uid")))
+            if self.path == "/api/portal/preview":
+                return self.send_json(portal_upload_preview(data.get("archive")))
+            if self.path == "/api/portal/assignment":
+                return self.send_json(portal_set_withdrawn(
+                    data.get("assignmentId"), data.get("withdrawn")))
+            if self.path == "/api/submission/preview":
+                return self.send_json({"ok": True, **submission_archive_preview(
+                    data.get("archive"))})
+            if self.path == "/api/portal/upload":
+                return self.send_json(portal_upload(
+                    data.get("archive"), data.get("description"),
+                    data.get("replace")))
             if self.path == "/api/submission/reveal":
                 return self.send_json(reveal_submission_folder(data.get("archive")))
             if self.path == "/api/submit":
