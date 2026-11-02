@@ -1022,7 +1022,7 @@ function highlightAsmLine(line) {
 
   code = escapeHtml(code)
     .replace(/(^|\s)(\.[\w.]+)/g, '$1<span class="directive">$2</span>')
-    .replace(/\b(x(?:[12]?\d|3[01]|0)|f(?:[12]?\d|3[01]|0)|zero|ra|sp|gp|tp|[ast]([0-9]|10|11)|ft(?:[0-9]|10|11)|fs(?:[0-9]|10|11)|fa[0-7])\b/g,
+    .replace(/\b(x(?:[12]?\d|3[01]|0)|f(?:[12]?\d|3[01]|0)|zero|ra|sp|gp|tp|a[0-7]|s(?:[0-9]|10|11)|t[0-6]|ft(?:[0-9]|10|11)|fs(?:[0-9]|10|11)|fa[0-7])\b/g,
       '<span class="register">$&</span>')
     .replace(/\b(c[._][a-z][\w.]*|add|addi|sub|sll|slli|slt|slti|sltu|sltiu|xor|xori|srl|srli|sra|srai|or|ori|and|andi|lui|auipc|lb|lbu|lh|lhu|lw|lwu|ld|sb|sh|sw|sd|mul|mulh|mulhsu|mulhu|div|divu|rem|remu|flw|fld|fsw|fsd|f(?:add|sub|mul|div|min|max)\.[sd]|f(?:madd|msub|nmsub|nmadd)\.[sd]|fsqrt\.[sd]|fsgnj[nx]?\.[sd]|f(?:eq|lt|le|class)\.[sd]|fcvt\.(?:w|wu|l|lu|s|d)\.(?:w|wu|l|lu|s|d)|fmv\.(?:x\.w|w\.x)|(?:lr|sc|amo(?:swap|add|xor|and|or|min|max|minu|maxu))\.w|beqz|bnez|beq|bne|blt|bge|bltu|bgeu|jal|jalr|j|jr|ret|call|tail|li|la|mv|neg|not|seqz|snez|sltz|sgtz|csrrw|csrrs|csrrc|csrrwi|csrrsi|csrrci|csrr|csrw|csrs|csrc|csrwi|csrsi|csrci|rdcycle|rdtime|rdinstret|fence\.i|fence|nop|ecall|ebreak|wfi|mret)\b/gi,
       '<span class="opcode">$&</span>')
